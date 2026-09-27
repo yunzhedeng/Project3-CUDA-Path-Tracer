@@ -20,9 +20,10 @@
 #include <thrust/tuple.h>
 #include <thrust/device_ptr.h>
 
-#define ERRORCHECK 1
+#define ERRORCHECK 0
+#define STREAM_COMPACTION 1
 #define SORT_BY_MATERIAL 0
-#define ANTI_ALIASING 0
+#define ANTI_ALIASING 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -203,8 +204,7 @@ __global__ void computeIntersections(
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (path_index < num_paths)
-    {
+    if (path_index < num_paths && pathSegments[path_index].remainingBounces > 0){
         PathSegment pathSegment = pathSegments[path_index];
 
         float t;
@@ -258,21 +258,25 @@ __global__ void computeIntersections(
     }
 }
 
-__global__ void buildMaterialKeys(int num_paths, 
-                                  ShadeableIntersection* intersection,
-                                  int* material_ids){
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < num_paths){ 
-            if(intersection[idx].t>0){
-                    material_ids[idx] = intersection[idx].materialId;
-            }
-            else{
-                material_ids[idx] = -1;
-            }
-            
-        }
-}
+__global__ void buildMaterialKeys(
+    int num_paths,
+    ShadeableIntersection* intersections,
+    int* material_keys)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
+    if (idx < num_paths)
+    {
+        if (intersections[idx].t > 0.0f)
+        {
+            material_keys[idx] = intersections[idx].materialId;
+        }
+        else
+        {
+            material_keys[idx] = -1;
+        }
+    }
+}
 
 // LOOK: "fake" shader demonstrating what you might do with the info in
 // a ShadeableIntersection, as well as how to use thrust's random number
@@ -291,7 +295,7 @@ __global__ void shadeFakeMaterial(
     Material* materials)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_paths)
+    if (idx < num_paths && pathSegments[idx].remainingBounces > 0)
     {
         ShadeableIntersection intersection = shadeableIntersections[idx];
         if (intersection.t > 0.0f) // if the intersection exists...
@@ -315,7 +319,7 @@ __global__ void shadeFakeMaterial(
                 thrust::default_random_engine rng =
                     makeSeededRandomEngine(
                         iter,
-                        idx,
+                        pathSegments[idx].pixelIndex,
                         pathSegments[idx].remainingBounces
                     );
                 scatterRay(
@@ -326,6 +330,11 @@ __global__ void shadeFakeMaterial(
                     rng
                 );
                 pathSegments[idx].remainingBounces --;
+
+                if (pathSegments[idx].remainingBounces == 0)
+                {
+                    pathSegments[idx].color = glm::vec3(0.0f);
+                }
 
             }
             // If there was no intersection, color the ray black.
@@ -357,7 +366,7 @@ struct PathTerminated
     __host__ __device__
     bool operator()(const PathSegment& path) const
     {
-        return path.remainingBounces == 0;
+        return path.remainingBounces <= 0;
     }
 };
 
@@ -368,6 +377,7 @@ __global__ void gatherTerminatedPaths(int nPaths, glm::vec3* image, PathSegment*
     if (index < nPaths && paths[index].remainingBounces == 0)
     {
         image[paths[index].pixelIndex] += paths[index].color;
+        paths[index].remainingBounces = -1;
     }
 }
 /**
@@ -460,13 +470,11 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
         if (SORT_BY_MATERIAL == 1){
             buildMaterialKeys<<<numblocksPathSegmentTracing, blockSize1d>>>(
-            num_paths,
-            dev_intersections,
-            dev_material_ids
+                num_paths,
+                dev_intersections,
+                dev_material_ids
             );
             checkCUDAError("build material keys");
-            cudaDeviceSynchronize();
-
 
             thrust::device_ptr<int> material_keys(dev_material_ids);
 
@@ -512,32 +520,29 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         checkCUDAError("gather terminated paths");
         cudaDeviceSynchronize();
 
-        dev_path_end = thrust::remove_if(
-            thrust::device,
-            dev_paths,
-            dev_path_end,
-            PathTerminated()
-        );
+        if (STREAM_COMPACTION == 1){
 
-        num_paths = static_cast<int>(dev_path_end - dev_paths);
+            dev_path_end = thrust::remove_if(
+                thrust::device,
+                dev_paths,
+                dev_path_end,
+                PathTerminated()
+            );
 
-        if (iter == 1)
-        {
-            std::cout << "Bounce "
-                    << depth
-                    << ": "
-                    << num_paths
-                    << " active rays"
-                    << std::endl;
+            num_paths = static_cast<int>(dev_path_end - dev_paths);
+
+            iterationComplete = (num_paths == 0);
         }
-        
-        iterationComplete = (num_paths == 0);
+        else{
+            iterationComplete = (depth >= traceDepth);
+        }
                 
         if (guiData != NULL)
         {
             guiData->TracedDepth = depth;
         }
     }
+
 
     ///////////////////////////////////////////////////////////////////////////
 

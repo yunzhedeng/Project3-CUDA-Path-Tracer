@@ -3,8 +3,9 @@ CUDA Path Tracer
 
 **University of Pennsylvania, CIS 565: GPU Programming and Architecture, Project 3**
 
-* (TODO) YOUR NAME HERE
-* Tested on: (TODO) Windows 22, i7-2222 @ 2.22GHz 22GB, GTX 222 222MB (Moore 2222 Lab)
+* Yunzhe Deng
+  * [LinkedIn](https://www.linkedin.com/in/yunzhedeng), [personal website](https://yunzhedeng.com)
+* Tested on: Windows 11, Intel Core i7-10750H @ 2.60GHz, 16 GB RAM, NVIDIA GeForce RTX 2060 (Personal Computer)
 
 ## Part 1 - Core Path Tracer
 
@@ -16,31 +17,15 @@ The primary ray is produced for each pixel starting from the camera. Based on th
 
 ### Diffuse BSDF and Multi-Bounce Path Tracing
 
-For diffuse surfaces, I implemented cosine-weighted hemisphere sampling using the provided `calculateRandomDirectionInHemisphere()` function.
-
-At every diffuse intersection, the current path throughput is multiplied by the material color:
+For diffuse surfaces, I implemented cosine-weighted hemisphere sampling using the provided `calculateRandomDirectionInHemisphere()` function. At every diffuse intersection, the current path throughput is multiplied by the material color:
 
 ```cpp
 pathSegment.color *= material.color;
 ```
 
-The ray origin is moved to the current surface intersection and a new direction is randomly sampled in the hemisphere around the surface normal.
+The ray origin is moved to the current surface intersection and a new direction is randomly sampled in the hemisphere around the surface normal. Conceptually, each path follows:
 
-Conceptually, each path follows:
-
-```text
-Camera Ray
-    ↓
-Intersection
-    ↓
-Diffuse BSDF Sampling
-    ↓
-New Ray
-    ↓
-Intersection
-    ↓
-...
-```
+![](./own_img/diffuse_BSDF_flowchart.png)
 
 When a path reaches an emissive material, its accumulated throughput is multiplied by the light color and emittance:
 
@@ -55,7 +40,7 @@ The path then terminates. If a ray leaves the scene without reaching a light sou
 The image below shows an early working result shortly after multi-bounce diffuse path tracing was enabled. At this point, the image is still dominated by Monte Carlo noise, but indirect illumination and color bleeding are already visible.
 
 <p align="center">
-  <img src="own_img/early_multibounce_noisy_cornell.png" width="70%">
+  <img src="own_img/early_multibounce_noisy_cornell.png" width="50%">
 </p>
 
 ---
@@ -70,25 +55,11 @@ A path terminates when:
 - it escapes the scene, or
 - it reaches the maximum allowed bounce depth.
 
-Processing terminated rays is wasteful since they cannot contribute to any image generation. Therefore, stream compaction is done after each bounce.
+Processing terminated rays is wasteful since they cannot contribute to any image generation. Therefore, stream compaction is done after each bounce. The rendering loop follows the structure below:
 
-The rendering loop follows the structure below:
+![](./own_img/stream_compaction_flowchart.png)
 
-```text
-Ray-Scene Intersection
-        ↓
-      Shading
-        ↓
-Gather Terminated Paths
-        ↓
-  Stream Compaction
-        ↓
- Continue Active Paths
-```
-
-The contribution of the final color from each terminated path to the image buffer is made by adding it to its respective `pixelIndex`.
-
-The terminated paths are deleted from the list of active paths. The total count of active paths is obtained from the new end of the path buffer:
+The contribution of the final color from each terminated path to the image buffer is made by adding it to its respective `pixelIndex`. The terminated paths are deleted from the list of active paths. The total count of active paths is obtained from the new end of the path buffer:
 
 ```cpp
 num_paths = static_cast<int>(dev_path_end - dev_paths);
@@ -96,165 +67,94 @@ num_paths = static_cast<int>(dev_path_end - dev_paths);
 
 The rendering loop continues until no active paths remain.
 
-#### Active Rays per Bounce
+#### Active Rays per Bounce: Open vs. Closed Scene
 
-The usefulness of stream compaction increases with the number of bounces since the probability that the rays will end increases with increasing path depth.
-
-The following data shows the number of active rays remaining after each bounce.
-
-| Bounce | Active Rays |
-| -----: | ----------: |
-|      0 |        TODO |
-|      1 |        TODO |
-|      2 |        TODO |
-|      3 |        TODO |
-|      4 |        TODO |
-|      5 |        TODO |
-|      6 |        TODO |
-|      7 |        TODO |
-|      8 |        TODO |
-
-<p align="center">
-  <img src="img/stream_compaction_active_rays.png" width="75%">
-</p>
-
-As the number of alive rays becomes fewer, fewer rays would be processed by the subsequent intersection and shading kernels. In the absence of stream compaction, rays which have been terminated will still occupy work on the GPU.
-
-#### Open Scene vs. Closed Scene
-
-The success of stream compaction is based on the nature of the scene itself.
-
- An open scene is one in which rays leave the scene and end prematurely. Such rays are discarded straightaway from the active path buffer.
-
-A closed scene will not allow any ray to escape the scene. Thus, a large number of paths are still alive for more bounces.
+The effectiveness of stream compaction depends strongly on scene geometry. In an open scene, rays can escape the scene and terminate early. In a closed scene, rays are surrounded by geometry and are more likely to remain active for additional bounces (for the closed scene, I added a front wall at `z = +5`, then moved the camera inside the box so that rays could no longer escape through the open front, this modified scene is saved as `scenes/cornell_closed.json`). The contrast of two scenes is shown below. 
 
 <table>
 <tr>
 <td align="center" width="50%">
 <b>Open Scene</b><br><br>
-<img src="img/stream_compaction_open_scene.png" width="100%">
+<img src="own_img/active_ray_open.png" width="100%">
 </td>
 <td align="center" width="50%">
 <b>Closed Scene</b><br><br>
-<img src="img/stream_compaction_closed_scene.png" width="100%">
+<img src="own_img/active_ray_closed.png" width="100%">
 </td>
 </tr>
 </table>
 
-The difference in active-ray behavior between the two scenes is shown below.
+The following active-ray counts were collected across all bounce depths within a single rendering iteration.
+
+| Scene / Bounce |      0 |      1 |      2 |      3 |      4 |      5 |      6 |      7 | 8 |
+| -------------- | -----: | -----: | -----: | -----: | -----: | -----: | -----: | -----: | -: |
+| Open Scene     | 640000 | 523164 | 360348 | 277462 | 221273 | 179171 | 145828 | 119308 | 0 |
+| Closed Scene   | 640000 | 622757 | 612276 | 601630 | 591352 | 581445 | 571626 | 561930 | 0 |
+
+The following active-ray counts were collected across all bounce depths within a single rendering iteration.
 
 <p align="center">
-  <img src="img/stream_compaction_open_vs_closed.png" width="75%">
+  <img src="./own_img/open_closed_bouncing_comparison.png" width="100%">
 </p>
+
+The difference is significant. By bounce 7, the open scene contains only 119,308 active rays, while the closed scene still contains 561,930 active rays. In the open scene, many rays escape and terminate early, allowing stream compaction to remove a large amount of inactive work before later intersection and shading stages. In the closed scene, rays remain enclosed by geometry and continue bouncing between surfaces, so substantially more paths remain active. This gives stream compaction a much greater opportunity to reduce unnecessary GPU work in the open scene.
+
+The drop to zero at bounce 8 is caused by the maximum trace depth of 8, which forces all remaining paths to terminate.
 
 #### Stream Compaction Performance
 
-All performance measurements were collected using the Release build with the same resolution, maximum trace depth, and scene configuration for each comparison.
+All performance measurements were collected using the Release build at 800×800 resolution with a maximum trace depth of 8. Material sorting and stochastic antialiasing were disabled, and error checking was disabled during timing. For each scene, the only changed variable was whether stream compaction was enabled or disabled.
 
 | Scene  | Stream Compaction | Time / Frame |  FPS |
 | ------ | ----------------- | -----------: | ---: |
-| Open   | OFF               |      TODO ms | TODO |
-| Open   | ON                |      TODO ms | TODO |
-| Closed | OFF               |      TODO ms | TODO |
-| Closed | ON                |      TODO ms | TODO |
+| Open   | OFF               |    84.298 ms | 11.9 |
+| Open   | ON                |    40.616 ms | 24.6 |
+| Closed | OFF               |   102.587 ms |  9.7 |
+| Closed | ON                |   103.924 ms |  9.6 |
 
 #### Analysis
 
-In the open scene, rays can escape early, causing the number of active paths to decrease quickly. Stream compaction prevents later intersection and shading kernels from processing a large number of terminated rays.
+Stream compaction offers considerable performance gain in the open scene. The average frame time decreases from **84.298 ms** to **40.616 ms**, that is, by about **51.8%**, and the frame rate grows from **11.9 FPS** to **24.6 FPS**. It implies **2.08× speedup**.
 
-In the closed scene, rays are more likely to remain active until later bounce depths. Because fewer paths terminate early, stream compaction has less opportunity to reduce the workload during the first several bounces.
+This outcome is fully consistent with the active-ray measurements above. In the open scene, numerous rays escape or get terminated within the first several bounces so that the number of active paths drops from 640,000 primary rays to only 119,308 by bounce 7. Stream compaction discards these terminated paths, enabling the intersection and shading kernels to process a substantially reduced amount of data.
 
-The overall performance benefit depends on whether the reduced intersection and shading workload outweighs the cost of performing stream compaction itself.
+On the other hand, there is no performance gain achieved in the closed scene through stream compaction. The frame time rises slightly from **102.587 ms** to **103.924 ms**, i.e., about **1.3%**, while the frame rate stays almost the same at **9.7 FPS** and **9.6 FPS**, respectively. In the closed scene, the rays cannot escape easily and 561,930 out of 640,000 initial rays remain active at bounce 7. As a consequence, not a lot of paths can be discarded, making the reduction of GPU work negligible compared to the cost of performing stream compaction.
 
-**TODO:** Replace or expand this paragraph using the final measured results.
+These results demonstrate that the effectiveness of stream compaction depends strongly on how quickly paths terminate. It is highly beneficial for open scenes with substantial early ray termination, but can introduce unnecessary overhead in closed scenes where most rays remain active until the maximum path depth.
 
 ---
 
 ### Material Sorting
 
-Different material types may require different BSDF calculations. When neighboring GPU threads evaluate different material branches, warp divergence can reduce shading efficiency.
+Different material types may require different BSDF calculations. When neighboring GPU threads evaluate different material branches, warp divergence can reduce shading efficiency. To improve shading coherence, I implemented material-based path sorting before the shading stage. After ray-scene intersection, each active path receives a sorting key corresponding to the `materialId` of its intersection. The rendering pipeline becomes:
 
-To improve shading coherence, I implemented material-based path sorting before the shading stage.
+![](./own_img/material_sorting_flowchart.png)
 
-After ray-scene intersection, each active path receives a sorting key corresponding to the `materialId` of its intersection.
+The material IDs are used as sorting keys while the corresponding `PathSegment` and `ShadeableIntersection` data remain paired during sorting.  Paths that interact with the same material are stored contiguously in memory after sorting before shading. Material sorting can be disabled/enabled for direct comparison of performance difference due to it.
 
-The rendering pipeline becomes:
-
-```text
-Ray-Scene Intersection
-        ↓
- Build Material Keys
-        ↓
- Sort by Material ID
-        ↓
-      Shading
-        ↓
-  Stream Compaction
-```
-
-The material IDs are used as sorting keys while the corresponding `PathSegment` and `ShadeableIntersection` data remain paired during sorting.
-
-After sorting, paths interacting with the same material are contiguous in memory before shading.
-
-Material sorting can be toggled on or off to directly compare its effect on performance.
-
-#### Material Sorting Comparison
-
-Both images below were rendered using the same Cornell box scene, resolution, trace depth, Release build configuration, and iteration count.
-
-<table>
-<tr>
-<td align="center" width="50%">
-<b>Material Sorting OFF</b><br><br>
-<img src="img/material_sorting_off_release.png" width="100%">
-</td>
-<td align="center" width="50%">
-<b>Material Sorting ON</b><br><br>
-<img src="img/material_sorting_on_release.png" width="100%">
-</td>
-</tr>
-</table>
-
-#### Performance
+#### Material Sorting Performance
 
 | Configuration        | Time / Frame |  FPS |
 | -------------------- | -----------: | ---: |
-| Material Sorting OFF |      TODO ms | TODO |
-| Material Sorting ON  |      TODO ms | TODO |
-
-The relative performance change was:
-
-**TODO% faster/slower with material sorting enabled.**
+| Material Sorting OFF |   37.128 ms | 26.9 |
+| Material Sorting ON  |     73.836ms | 13.5 |
 
 #### Analysis
 
-Material sorting introduces additional GPU work because material keys must first be generated and the active paths must then be reordered.
+Material sorting did not improve performance for the current Cornell box scene. With material sorting disabled, the renderer required **37.128 ms/frame**, while enabling material sorting increased the frame time to **73.836 ms/frame**. This corresponds to an approximately **98.9% increase in frame time**, meaning that the sorted version was almost twice as slow in this test.
 
-However, grouping paths by material increases the probability that neighboring threads execute the same BSDF code path. This can reduce warp divergence during the shading stage.
+The primary reason is that material sorting introduces additional work at every bounce. Material keys must first be generated, and `thrust::sort_by_key` must then reorder the active paths and their corresponding intersections before shading. This sorting and memory movement adds a significant amount of overhead.
 
-In the Cornell box test, enabling material sorting changed the average frame time from **TODO ms/frame** to **TODO ms/frame**.
+In the current renderer, the majority of non-emissive surfaces share the same diffuse BSDF. Even if the surfaces on the red, green, and white Cornell boxes are of different materials, the shading process for all of them is almost the same. Consequently, there is no sufficient material-dependent divergence caused by the shading kernel to enable the gain from sorting.
 
-**TODO: Keep one of the following paragraphs depending on the final result.**
-
-If material sorting improves performance:
-
-> The reduction in shading divergence was large enough to outweigh the additional cost of generating material keys and sorting the active paths.
-
-If material sorting decreases performance:
-
-> The sorting overhead was larger than the shading benefit in this scene. Most non-emissive materials currently use the same diffuse BSDF, so the amount of material-dependent branch divergence is relatively small.
-
-The potential benefit of material sorting should become larger as the renderer supports more computationally different BSDFs, such as diffuse reflection, specular reflection, and refraction.
+Material sorting is expected to become more useful in scenes containing a larger variety of computationally different BSDFs, such as diffuse, specular, and refractive materials. In those cases, grouping paths by material can reduce divergence more substantially and may better offset the cost of sorting.
 
 ---
 
 ### Stochastic Sampled Antialiasing
 
-Without stochastic antialiasing, every iteration generates the primary camera ray using the same fixed location inside each pixel.
-
-Repeatedly sampling the same sub-pixel location can produce visible aliasing along object boundaries.
-
-I implemented stochastic sampled antialiasing by generating two independent random offsets for every pixel and iteration:
+#### Sampling Pattern
+Without stochastic antialiasing, every iteration traces the camera ray through the same fixed sub-pixel location. Repeatedly sampling the same location can produce visible aliasing along high-contrast geometry boundaries. To address this, I implemented stochastic sampled antialiasing by jittering the primary ray independently in both the x and y directions for every pixel and every iteration:
 
 ```cpp
 float jitterX = u01(rng);
@@ -264,70 +164,39 @@ float sampleX = (float)x + jitterX;
 float sampleY = (float)y + jitterY;
 ```
 
-The jittered coordinates are then used to generate the primary ray direction.
-
-Instead of repeatedly sampling one fixed location inside a pixel:
-
-```text
-+---------+
-|         |
-|    X    |
-|         |
-+---------+
-```
-
-different iterations sample different sub-pixel positions:
-
-```text
-+---------+
-|  •      |
-|      •  |
-|    •    |
-| •     • |
-+---------+
-```
-
-As the number of iterations increases, these samples are averaged together, producing smoother estimates of pixel coverage along geometry boundaries.
-
-#### Antialiasing Comparison
-
-Both images below were rendered using the same scene, resolution, maximum trace depth, and iteration count.
+This causes each iteration to sample a slightly different sub-pixel location. Over many iterations, these samples are averaged together, producing smoother estimates of pixel coverage and reducing jagged edges.
 
 <table>
 <tr>
 <td align="center" width="50%">
-<b>Antialiasing OFF</b><br><br>
-<img src="img/antialiasing_off_500.png" width="100%">
+<b>Single Fixed Sample per Pixel</b><br><br>
+<img src="./own_img/fixed_subpixel_sample.png" width="70%">
 </td>
 <td align="center" width="50%">
-<b>Stochastic Antialiasing ON</b><br><br>
-<img src="img/antialiasing_on_500.png" width="100%">
+<b>Random Jittered Samples per Pixel</b><br><br>
+<img src="./own_img/jittered_subpixel_samples.png" width="70%">
 </td>
 </tr>
 </table>
 
-The effect of stochastic antialiasing is most visible along high-contrast geometry boundaries, such as sphere silhouettes, light-source edges, and diagonal edges.
+#### Visual Comparison
+The effect of stochastic antialiasing is most visible along object silhouettes and lighting boundaries. The following comparison was rendered using the same scene and settings, with antialiasing disabled on the left and enabled on the right.
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Antialiasing OFF</b><br><br>
+<img src="./own_img/AA_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Stochastic Antialiasing ON</b><br><br>
+<img src="./own_img/AA_on.png" width="100%">
+</td>
+</tr>
+</table>
 
-At low iteration counts, Monte Carlo path-tracing noise can obscure the antialiasing improvement. As the image converges, stochastic sub-pixel sampling produces smoother boundaries than repeatedly sampling the same position within every pixel.
+#### Analysis
 
-**TODO:** Replace this sentence with the final visual observation from the AA comparison.
+Based on the antialiasing test, the results show that stochastic sampled antialiasing enhances the appearance of the sphere silhouette due to reduced stair-case effect on the object boundary. From the image without antialiasing, one can see that the edge of the sphere looks more pixelated since the sampling takes place from the same sub-pixel coordinates per iteration. However, when antialiasing is applied, each iteration jitters the sampled position within the pixel so as to get an accurate average approximation of partial pixel coverage.
 
----
+The greatest improvement is seen on the curved outer boundary of the sphere particularly the upper left and right edges that have been marked on the comparison images. While both renderings possess Monte Carlo noise, antialiased rendering keeps the silhouette smooth. This means that stochastic sub-pixel sampling makes edge quality better.
 
-### Part 1 Summary
-
-The completed core renderer includes:
-
-- CUDA-based Monte Carlo path tracing
-- Cosine-weighted diffuse BSDF sampling
-- Multi-bounce indirect illumination
-- Emissive surface lighting
-- Path termination for escaped rays and exhausted bounce depth
-- Stream compaction of terminated paths
-- Active-ray analysis across bounce depth
-- Open-scene and closed-scene stream compaction comparison
-- Toggleable material sorting
-- Material sorting performance comparison
-- Stochastic sub-pixel antialiasing
-
-These features form the base renderer used for the additional rendering and performance features implemented in Part 2.
