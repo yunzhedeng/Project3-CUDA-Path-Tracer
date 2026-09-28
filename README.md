@@ -15,7 +15,7 @@ The primary ray is produced for each pixel starting from the camera. Based on th
 
 ---
 
-### Diffuse BSDF and Multi-Bounce Path Tracing
+### 1.1 Diffuse BSDF and Multi-Bounce Path Tracing
 
 For diffuse surfaces, I implemented cosine-weighted hemisphere sampling using the provided `calculateRandomDirectionInHemisphere()` function. At every diffuse intersection, the current path throughput is multiplied by the material color:
 
@@ -45,7 +45,7 @@ The image below shows an early working result shortly after multi-bounce diffuse
 
 ---
 
-### Stream Compaction
+### 1.2 Stream Compaction
 
 Many rays that bounce around the scene have paths that end before they get to the trace depth limit.
 
@@ -69,7 +69,7 @@ The rendering loop continues until no active paths remain.
 
 #### Active Rays per Bounce: Open vs. Closed Scene
 
-The effectiveness of stream compaction depends strongly on scene geometry. In an open scene, rays can escape the scene and terminate early. In a closed scene, rays are surrounded by geometry and are more likely to remain active for additional bounces (for the closed scene, I added a front wall at `z = +5`, then moved the camera inside the box so that rays could no longer escape through the open front, this modified scene is saved as `scenes/cornell_closed.json`). The contrast of two scenes is shown below. 
+The effectiveness of stream compaction depends strongly on scene geometry. In an open scene, rays can escape the scene and terminate early. In a closed scene, rays are surrounded by geometry and are more likely to remain active for additional bounces (for the closed scene, I added a front wall at `z = +5`, then moved the camera inside the box so that rays could no longer escape through the open front, this modified scene is saved as `scenes/cornell_closed.json`). The contrast of two scenes is shown below.
 
 <table>
 <tr>
@@ -90,8 +90,6 @@ The following active-ray counts were collected across all bounce depths within a
 | -------------- | -----: | -----: | -----: | -----: | -----: | -----: | -----: | -----: | -: |
 | Open Scene     | 640000 | 523164 | 360348 | 277462 | 221273 | 179171 | 145828 | 119308 | 0 |
 | Closed Scene   | 640000 | 622757 | 612276 | 601630 | 591352 | 581445 | 571626 | 561930 | 0 |
-
-The following active-ray counts were collected across all bounce depths within a single rendering iteration.
 
 <p align="center">
   <img src="./own_img/open_closed_bouncing_comparison.png" width="100%">
@@ -124,7 +122,7 @@ These results demonstrate that the effectiveness of stream compaction depends st
 
 ---
 
-### Material Sorting
+### 1.3 Material Sorting
 
 Different material types may require different BSDF calculations. When neighboring GPU threads evaluate different material branches, warp divergence can reduce shading efficiency. To improve shading coherence, I implemented material-based path sorting before the shading stage. After ray-scene intersection, each active path receives a sorting key corresponding to the `materialId` of its intersection. The rendering pipeline becomes:
 
@@ -151,9 +149,10 @@ Material sorting is expected to become more useful in scenes containing a larger
 
 ---
 
-### Stochastic Sampled Antialiasing
+### 1.4 Stochastic Sampled Antialiasing
 
 #### Sampling Pattern
+
 Without stochastic antialiasing, every iteration traces the camera ray through the same fixed sub-pixel location. Repeatedly sampling the same location can produce visible aliasing along high-contrast geometry boundaries. To address this, I implemented stochastic sampled antialiasing by jittering the primary ray independently in both the x and y directions for every pixel and every iteration:
 
 ```cpp
@@ -180,7 +179,9 @@ This causes each iteration to sample a slightly different sub-pixel location. Ov
 </table>
 
 #### Visual Comparison
+
 The effect of stochastic antialiasing is most visible along object silhouettes and lighting boundaries. The following comparison was rendered using the same scene and settings, with antialiasing disabled on the left and enabled on the right.
+
 <table>
 <tr>
 <td align="center" width="50%">
@@ -200,3 +201,453 @@ Based on the antialiasing test, the results show that stochastic sampled antiali
 
 The greatest improvement is seen on the curved outer boundary of the sphere particularly the upper left and right edges that have been marked on the comparison images. While both renderings possess Monte Carlo noise, antialiased rendering keeps the silhouette smooth. This means that stochastic sub-pixel sampling makes edge quality better.
 
+---
+
+## Part 2 - Additional Features
+
+### 2.1 Russian Roulette Path Termination
+
+Termination of Russian roulette was introduced to avoid performing too much work that will not affect the final rendering result, because after several bounces the throughput of the path may be extremely low, but without the termination of the path the calculation will go on up to the maximum depth of tracing.
+
+Russian roulette begins after bounce 3. The survival probability of a path is estimated from the largest component of its current throughput:
+
+```cpp
+float survivalProbability = fmaxf(
+    pathSegments[idx].color.x,
+    fmaxf(
+        pathSegments[idx].color.y,
+        pathSegments[idx].color.z
+    )
+);
+
+survivalProbability = fminf(
+    0.95f,
+    fmaxf(0.05f, survivalProbability)
+);
+```
+
+A random value is then generated to determine whether the path survives:
+
+```cpp
+float rouletteSample = u01(rng);
+
+if (rouletteSample > survivalProbability)
+{
+    pathSegments[idx].color = glm::vec3(0.0f);
+    pathSegments[idx].remainingBounces = 0;
+}
+else
+{
+    pathSegments[idx].color /= survivalProbability;
+}
+```
+
+Those paths which do not pass the test are stopped right away and subsequently discarded through stream compaction. The paths which survive then divide their throughput by the survival probability. This is done to take into account those paths which were stopped.
+
+#### Visual and Performance Comparison
+
+The two images below were rendered using the same scene and rendering parameters. At approximately 500 iterations, the results are visually very similar, which is expected because Russian roulette should reduce computation without systematically changing the final image brightness.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Russian Roulette OFF</b><br><br>
+<img src="own_img/RR_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Russian Roulette ON</b><br><br>
+<img src="own_img/RR_on.png" width="100%">
+</td>
+</tr>
+</table>
+
+The performance comparison was collected using the Release build with the same resolution, trace depth, scene, and rendering settings. Stream compaction was enabled, while material sorting and stochastic antialiasing were disabled. The only changed variable was whether Russian roulette was enabled.
+
+| Russian Roulette | Time / Frame |  FPS |
+| ---------------- | -----------: | ---: |
+| OFF              |    37.564 ms | 26.6 |
+| ON               |    31.058 ms | 32.2 |
+
+#### Analysis
+
+Enabling Russian roulette reduced the average frame time from 37.564 ms to 31.058 ms, corresponding to approximately a **17.3% reduction in frame time** and a **1.21× speedup**. The displayed frame rate increased from 26.6 FPS to 32.2 FPS.
+
+The improvement in performance is due to the ability of killing low-throughput paths before reaching the maximum depth of trace. After paths have been killed, stream compaction will remove them from the active path buffer, allowing less paths to be processed in subsequent stages such as intersection and shading.
+
+The quality of the rendering remains virtually the same because the survivors are split according to their probability of survival. Thus, Russian roulette is a method that sacrifices sampling variance for computational savings.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+Russian roulette is well-suited for GPU path tracing, since each individual path can calculate the probability of survival based on its own throughput and a random sample. Thus, many such decisions can be calculated in parallel. The CPU version will employ the same probability calculation method, but it will work on far fewer paths at any given time. With the GPU implementation, there is a chance that irregular path termination will cause thread divergence in neighboring threads, which can be mitigated through stream compaction.
+
+#### Further Optimization
+
+The currently implemented algorithm is that of using the maximum RGB throughput component as the probability of survival and performing the Russian roulette test from bounce 3. These values can be optimized according to the nature of the particular scene. For instance, luminance can be used instead of the maximum RGB component for evaluating the contribution of a certain ray. It can also be decided upon where to begin the Russian roulette test based on adaptive sampling.
+
+---
+
+### 2.2 Depth of Field
+
+Physically-based depth of field was implemented using a thin-lens camera model. Instead of generating every primary ray from exactly the same camera position, the ray origin is randomly sampled across a circular aperture. Each sampled ray is then redirected toward the same focal plane.
+
+The aperture position is sampled uniformly over a disk:
+
+```cpp
+float lensU = u01(rng);
+float lensV = u01(rng);
+
+float radius = DOF_APERTURE_RADIUS * sqrtf(lensU);
+float angle = 6.28318530718f * lensV;
+
+glm::vec3 lensOffset =
+    cam.right * (radius * cosf(angle))
+    + cam.up * (radius * sinf(angle));
+```
+
+The original camera ray is used to determine a point on the focal plane:
+
+```cpp
+glm::vec3 viewDirection = glm::normalize(cam.view);
+
+float focusT =
+    DOF_FOCAL_DISTANCE /
+    glm::dot(primaryDirection, viewDirection);
+
+glm::vec3 focalPoint =
+    cam.position + primaryDirection * focusT;
+```
+
+The primary ray is then moved to the sampled aperture position and redirected toward the focal point:
+
+```cpp
+segment.ray.origin =
+    cam.position + lensOffset;
+
+segment.ray.direction =
+    glm::normalize(
+        focalPoint - segment.ray.origin
+    );
+```
+
+The aperture radius controls the strength of the depth-of-field effect, while the focal distance determines the plane that remains sharp. A larger aperture produces stronger blur for objects away from the focal plane.
+
+#### Visual and Performance Comparison
+
+In order to facilitate the observation of the depth of field effect, I have created a special setting wherein there are three balls at different distances from the camera. The green ball is situated at the focal plane while the red ball is closer to the camera compared to the blue ball.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Depth of Field OFF</b><br><br>
+<img src="./own_img/DFD_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Depth of Field ON</b><br><br>
+<img src="./own_img/DFD_on.png" width="100%">
+</td>
+</tr>
+</table>
+
+Without depth of field, all three spheres look equally sharp. With depth of field turned on, the middle sphere stays in focus, while the red one closer to the observer and the blue one further away appear blurred.
+
+Performance testing was done with the Release build in the same scene, resolution, trace depth, and other rendering parameters. Stream compaction was turned on, but material sorting, stochastic antialiasing, and Russian roulette were turned off. Depth of field was the only variable tested here.
+
+| Depth of Field | Time / Frame |  FPS |
+| -------------- | -----------: | ---: |
+| OFF            |   64. 750 ms | 15.4 |
+| ON             |   61. 791 ms | 16.2 |
+
+#### Analysis
+
+The depth of field example shows how sampling of the primary rays through a finite aperture works. Without depth of field, all three spheres will be equally sharp regardless of their distance from the camera. However, when depth of field is activated, the central green sphere is still in focus while the red one that is closer to the camera and the blue sphere that is farther from it are both out of focus and thus blurred.
+
+It is explained by the convergence of the rays emitted from different parts of the aperture near the focal plane. For those objects that are off the focal plane, the rays hit different locations on the object. The differences average out during multiple iterations.
+
+In the measurement experiment, the frame time shifted from 64.750 ms when depth of field was turned off to 61.791 ms when the feature was on. This very slight difference is not enough for suggesting any performance enhancement because of depth of field. In addition, since depth of field performs just a couple of additional samples and calculations, which take much less time than those of the intersection and shading process, then the measurement difference might be a run-to-run difference.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+The algorithm depth of field is quite suitable for implementation on the GPU since each pixel computes independently its aperture point and constructs its main ray. The algorithm depth of field implemented on the CPU would involve the same thin lens computations, but the number of rays would be much smaller. The advantage that the GPU has from the independence of the algorithm is the lack of necessity in communication between the pixels. Depth of field computations thus do not add much overhead to the rendering cost.
+
+#### Further Optimization
+
+The current implementation utilizes compile-time constants for the aperture radius and focal distance. These could have been set through the camera configuration within the scene file, providing for the possibility of having independent focus settings for every scene without requiring any recompilation of the renderer. There is the possibility of further extending the implementation with the use of other aperture shapes or lens sampling techniques.
+
+---
+
+### 2.3 Refraction and Fresnel Effects
+
+Refraction was implemented to support transparent dielectric materials such as glass. A refractive material stores an index of refraction (IOR), which determines how much the ray bends when passing between air and the material.
+
+A glass material can be defined directly in the scene file:
+
+```json
+"glass": {
+    "TYPE": "Refractive",
+    "RGB": [1.0, 1.0, 1.0],
+    "IOR": 1.5
+}
+```
+
+During ray-scene intersection, the renderer records whether the ray is entering or leaving the object. This is necessary because the refractive index ratio changes depending on the direction of travel:
+
+```cpp
+if (outside)
+{
+    n1 = 1.0f;
+    n2 = m.indexOfRefraction;
+}
+else
+{
+    n1 = m.indexOfRefraction;
+    n2 = 1.0f;
+}
+
+float eta = n1 / n2;
+```
+
+The reflected and refracted directions are computed using `glm::reflect` and `glm::refract`. Fresnel reflection is approximated using Schlick's approximation:
+
+```cpp
+float r0 = (n1 - n2) / (n1 + n2);
+r0 = r0 * r0;
+
+float oneMinusCos = 1.0f - cosTheta;
+
+float reflectProbability =
+    r0 +
+    (1.0f - r0) *
+    oneMinusCos *
+    oneMinusCos *
+    oneMinusCos *
+    oneMinusCos *
+    oneMinusCos;
+```
+
+A random sample determines whether the path reflects or refracts:
+
+```cpp
+if (totalInternalReflection ||
+    randomSample < reflectProbability)
+{
+    newDirection =
+        glm::reflect(
+            incomingDirection,
+            surfaceNormal
+        );
+}
+else
+{
+    newDirection =
+        glm::refract(
+            incomingDirection,
+            surfaceNormal,
+            eta
+        );
+}
+```
+
+Total internal reflection is also handled when a ray attempts to leave a higher-index material at an angle where no valid refracted direction exists.
+
+#### Visual and Performance Comparison
+
+To clearly demonstrate the effect of refraction, I created a dedicated test scene containing a glass sphere placed in front of colored vertical stripes. This makes the distortion of the background through the glass easy to observe.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Refraction OFF</b><br><br>
+<img src="./own_img/refraction_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Refraction ON</b><br><br>
+<img src="own_img/refraction_on.png" width="100%">
+</td>
+</tr>
+</table>
+
+Without refraction, the glass material becomes diffuse again and the sphere acts as an opaque object, hiding the colorful background behind. With refraction turned on, rays can penetrate the sphere and hit the surfaces behind it. The colored lines become visible in the sphere and are distorted due to the change in direction of rays on both glass interfaces.
+
+This performance analysis was done using the Release build with the same scene, resolution, trace depth, and other parameters for rendering. Stream compaction was used, but material sorting, stochastic antialiasing, Russian roulette, and depth of field were not. The only difference was the use of refraction.
+
+| Refraction | Time / Frame |  FPS |
+| ---------- | -----------: | ---: |
+| OFF        |    24.305 ms | 41.1 |
+| ON         |    59.249 ms | 16.9 |
+
+#### Analysis
+
+Enabling refraction significantly increases the amount of work required to trace paths through the scene. In the measured test, the average frame time increased from 24.305 ms to 59.249 ms, corresponding to approximately a **143.8% increase in frame time**. The displayed frame rate decreased from 41.1 FPS to 16.9 FPS.
+
+Extra cost results from the following reasons. Refractive rays need a Fresnel computation, reflections, and refractions, as well as further ray bounces through both entry and exit faces of the glass object. On the other hand, without refractions, the sphere acts like any regular diffuse surface without further dielectric computations.
+
+However, the difference between the two cases is greater than one might expect based on the extra computational cost. Enabling refractions makes it possible to see the colored background behind the sphere and even distorts it. Also, there is greater Fresnel reflection near the curved exterior surface of the sphere, while more rays pass through normal viewing areas.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+The refraction function lends itself to GPU path tracing since each path makes an independent decision on whether or not to go through a refractive object based on the Fresnel probability and either calculates the reflected or refracted ray. A hypothetical CPU solution would do the same calculations for reflection, refraction, and Fresnel, although for a much smaller number of paths at once. On the other hand, materials with refraction can create some GPU warp divergence, as neighboring rays can take their own paths for reflection or transmission.
+
+#### Further Optimization
+
+Currently, Schlick’s approximation is employed in the implementation since it is an effective means of estimating Fresnel reflectance at a reasonable cost and produces visually plausible dielectric behavior. Optimization could be made possible by grouping refractive rays before shading to promote instruction-level coherence. In addition, other complicated dielectric behavior can be supported such as absorbing colored glass, rough refraction, nesting dielectric surfaces, and more realistic Fresnel calculations.
+
+---
+
+### 2.4 Direct Lighting
+
+Direct lighting was implemented by  sampling a point from a random emissive area light whenever a diffuse surface is intersected with the scene. This method enables the rendering engine to cast a shadow ray towards the light source without having to depend on randomly scattered rays.
+
+A random point is sampled on the rectangular emissive light:
+
+```cpp
+float u = u01(rng) - 0.5f;
+float v = u01(rng) - 0.5f;
+
+glm::vec3 localLightPoint(
+    u,
+    -0.5f,
+    v
+);
+
+glm::vec3 lightPoint =
+    multiplyMV(
+        light.transform,
+        glm::vec4(localLightPoint, 1.0f)
+    );
+```
+
+The direction and distance from the current surface point to the sampled light position are then computed:
+
+```cpp
+glm::vec3 toLight =
+    lightPoint - intersectPoint;
+
+float distanceSquared =
+    glm::dot(toLight, toLight);
+
+float distance =
+    sqrtf(distanceSquared);
+
+glm::vec3 lightDirection =
+    toLight / distance;
+```
+
+A shadow ray is traced toward the light to determine whether the sampled point is visible. If another object intersects the shadow ray before it reaches the light, the direct-light contribution is discarded.
+
+For a visible light sample, the contribution is weighted by the surface cosine, light cosine, light area, and inverse-square distance:
+
+```cpp
+glm::vec3 directContribution =
+    pathSegment.color *
+    surfaceMaterial.color *
+    emittedLight *
+    (
+        surfaceCos *
+        lightCos *
+        lightArea /
+        (PI * distanceSquared)
+    );
+```
+
+The renderer still continues the normal diffuse path afterward, allowing indirect illumination to be accumulated in addition to the explicitly sampled direct lighting.
+
+#### Visual and Performance Comparison
+
+The following images were captured from the same Cornell box scene at exactly **50 iterations**. All rendering settings were kept identical except for the direct-lighting toggle.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Direct Lighting OFF</b><br><br>
+<img src="./own_img/direct_lighting_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Direct Lighting ON</b><br><br>
+<img src="./own_img/direct_light_on.png" width="100%">
+</td>
+</tr>
+</table>
+
+The difference in convergence at the same number of iterations is rather great. In the absence of direct lighting, the scene still suffers from Monte Carlo noise, as diffuse rays have to randomly hit the light source. With direct lighting on, the surfaces get their own light samples at each iteration, thus creating cleaner lighting and shadows.
+
+This performance test was made with the Release build, with the same scene, resolution, trace depth, and rendering parameters. Stream compaction was used, but no material sorting, stochastic antialiasing, Russian roulette, depth of field, or refractions.
+
+| Direct Lighting | Time / Frame |  FPS |
+| --------------- | -----------: | ---: |
+| OFF             |    41.131 ms | 24.3 |
+| ON              |    73.381 ms | 13.6 |
+
+#### Analysis
+
+Enabling direct lighting increased the average frame time from 41.131 ms to 73.381 ms, corresponding to approximately a **78.4% increase in frame time**. The displayed frame rate decreased from 24.3 FPS to 13.6 FPS.
+
+Even though the complexity grows with each iteration, the speed of convergence is much faster as seen in the images. The difference can be seen in just 50 iterations where the direct lighting result looks a lot smoother as opposed to the baseline image that is still noisy due to Monte Carlo effect. Thus, the increased computational cost makes up for fewer necessary iterations to produce a clean image.
+
+This performance overhead is caused by the extra light sample and shadow rays per diffuse surface hit. This shadow ray has to be tested against the geometry once again in order to see if it is obstructed by any object. Nevertheless, explicit sampling of the light source significantly raises the chances of producing useful direct light information.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+Direct illumination is very appropriate for GPU rendering since each lighting point can compute the effect of the illumination independently and in parallel. In contrast, the same operations will be carried out with a CPU program, but far fewer shadow rays will be computed simultaneously. The problem with the GPU is the possible divergence between rays due to the difference in their visibility computations and geometry intersection computations of the neighboring threads. Nevertheless, the number of independent rays ensures good parallelism for the lighting computations.
+
+#### Further Optimization
+
+The current implementation checks the intersection of the shadow rays with the scene geometry in an unoptimized way. This can be made much faster by implementing a spatial data structure like a BVH, which would allow reducing the number of intersection tests with the geometry. At the moment, the renderer samples one sample from one light source rectangle per shading process. In future, more samples can be taken or sampled not uniformly but rather in proportion to their contribution.
+
+---
+
+### 2.5 Low-Discrepancy Sampling
+
+To increase the quality of sampling, low-discrepancy hemisphere sampling via a 2D Halton sequence was introduced. The difference between random sampling and Halton sampling is that the latter generates more evenly spaced samples, thereby generating fewer clusters and producing a smoother noise with fewer iterations.
+
+I implemented a Halton sequence generator for 1D and expanded it to be a 2D sampler with bases of 2 and 3. Whenever the low-discrepancy flag is set to true, for each ray tracing path, a 2D sample is generated based on the current iteration number, the pixel position, and the depth of the current bounce and used to generate a cosine-weighted hemisphere direction for diffuse scattering.
+
+However, this does not affect the outcome of the light in the end because it is only the distribution of noise that gets improved, especially when there are very few iterations where the output image will converge evenly.
+
+#### Visual Comparison and Performance
+
+The following comparison was captured with direct lighting enabled at a low iteration count so that the difference in noise distribution is easier to observe.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Low-Discrepancy OFF (Random)</b><br><br>
+<img src="./own_img/low_discrepancy_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Low-Discrepancy ON (Halton)</b><br><br>
+<img src="./own_img/low_discrepancy_on.png" width="100%">
+</td>
+</tr>
+</table>
+
+To make the difference easier to see, I also include zoomed-in crops from the same image region. The Halton version shows finer and more evenly distributed noise, while the random version exhibits larger noise clumps.
+
+<table>
+<tr>
+<td align="center"><b>Low-Discrepancy OFF (Random)</b></td>
+<td align="center"><b>Low-Discrepancy ON (Halton)</b></td>
+</tr>
+<tr>
+<td align="center"><img src="own_img/low_discrepancy_off_crop.png" width="650"></td>
+<td align="center"><img src="own_img/low_discrepancy_on_crop.png" width="650"></td>
+</tr>
+</table>
+
+It is apparent mostly in the darker areas of the wall and floor around the sphere where the random sampler creates more noise due to larger sample grain and clusters in those areas. On the other hand, because the low discrepancy sampler provides a more even distribution of samples, its noise is more refined.
+
+All performance results were obtained at 800x800 resolution using the Release configuration and a maximum trace depth of 8.
+
+| Sampling Method                   | Time / Frame |  FPS |
+| --------------------------------- | -----------: | ---: |
+| Random Sampling                   |    76.105 ms | 13.1 |
+| Low-Discrepancy Sampling (Halton) |    79.194 ms | 12.6 |
+
+The Halton-based sampler is slightly slower, increasing frame time by about 4.1%, but it produces visibly better sample distribution at low iteration counts. This makes it a useful quality-oriented improvement, especially when the renderer is run for only a small number of iterations.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+The low discrepancy sampling scheme works especially well for GPU rendering since the samples coordinates can be determined by each individual thread independently based on the current iteration, pixel index, and the bounce number. There is no need for communication between threads which makes the algorithm highly parallelizable. A potential CPU approach will employ the same principle of using Halton sequences but will evaluate many fewer paths at once. The GPU approach works especially well due to the low computational costs of the sampling step.
+
+#### Further Optimization
+
+Diffuse hemisphere sampling is currently achieved using a Halton sequence based on bases 2 and 3. There are several other ways in which the current approach can be enhanced by making use of Cranley-Patterson rotation, Owen scrambling, or other forms of low-discrepancy sequences. It may also be beneficial to extend low-discrepancy sampling from the current use on diffuse bounce direction sampling to camera sampling, depth of field lens sampling, or even direct light sampling.

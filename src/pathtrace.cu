@@ -21,9 +21,25 @@
 #include <thrust/device_ptr.h>
 
 #define ERRORCHECK 0
+
 #define STREAM_COMPACTION 1
+
 #define SORT_BY_MATERIAL 0
-#define ANTI_ALIASING 1
+
+#define ANTI_ALIASING 0
+
+#define RUSSIAN_ROULETTE 0
+#define RR_START_DEPTH 3
+
+#define DEPTH_OF_FIELD 0
+#define DOF_APERTURE_RADIUS 0.70f
+#define DOF_FOCAL_DISTANCE 10.5f
+
+#define REFRACTION 0
+
+#define DIRECT_LIGHTING 1
+
+#define LOW_DISCREPANCY_SAMPLING 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -166,27 +182,51 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         float sampleX = (float)x + jitterX;
         float sampleY = (float)y + jitterY;
 
-        segment.ray.origin = cam.position;
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
-        // TODO: implement antialiasing by jittering the ray
-        if (ANTI_ALIASING == 0){
-            segment.ray.direction = glm::normalize(
-                cam.view
-                - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f)
-                - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f)
+        glm::vec3 primaryDirection;
+
+        if (ANTI_ALIASING == 0)
+        {
+            primaryDirection = glm::normalize( cam.view - cam.right * cam.pixelLength.x *
+                ((float)x - (float)cam.resolution.x * 0.5f) - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f)
             );
         }
-        else{
-            segment.ray.direction = glm::normalize(
-                cam.view
-                - cam.right * cam.pixelLength.x * (sampleX - (float)cam.resolution.x * 0.5f)
-                - cam.up * cam.pixelLength.y * (sampleY - (float)cam.resolution.y * 0.5f)
+        else
+        {
+            primaryDirection = glm::normalize( cam.view - cam.right * cam.pixelLength.x *
+                (sampleX - (float)cam.resolution.x * 0.5f) - cam.up * cam.pixelLength.y * (sampleY - (float)cam.resolution.y * 0.5f)
             );
+        }
+
+        segment.ray.origin = cam.position;
+        segment.ray.direction = primaryDirection;
+
+        if (DEPTH_OF_FIELD == 1)
+        {
+            float lensU = u01(rng);
+            float lensV = u01(rng);
+
+            float radius = DOF_APERTURE_RADIUS * sqrtf(lensU);
+            float angle = 6.28318530718f * lensV;
+
+            glm::vec3 lensOffset = cam.right * (radius * cosf(angle)) + cam.up * (radius * sinf(angle));
+
+            glm::vec3 viewDirection = glm::normalize(cam.view);
+
+            float focusT = DOF_FOCAL_DISTANCE / glm::dot(primaryDirection, viewDirection);
+
+            glm::vec3 focalPoint = cam.position + primaryDirection * focusT;
+
+            segment.ray.origin = cam.position + lensOffset;
+
+            segment.ray.direction = glm::normalize( focalPoint - segment.ray.origin);
         }
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
+
+        segment.allowEmission = true;
     }
 }
 
@@ -212,7 +252,7 @@ __global__ void computeIntersections(
         glm::vec3 normal;
         float t_min = FLT_MAX;
         int hit_geom_index = -1;
-        bool outside = true;
+        bool hitOutside = true;
 
         glm::vec3 tmp_intersect;
         glm::vec3 tmp_normal;
@@ -222,14 +262,15 @@ __global__ void computeIntersections(
         for (int i = 0; i < geoms_size; i++)
         {
             Geom& geom = geoms[i];
+            bool tmpOutside = true;
 
             if (geom.type == CUBE)
             {
-                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
             }
             else if (geom.type == SPHERE)
             {
-                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
+                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
             }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 
@@ -241,6 +282,7 @@ __global__ void computeIntersections(
                 hit_geom_index = i;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
+                hitOutside = tmpOutside;
             }
         }
 
@@ -254,6 +296,7 @@ __global__ void computeIntersections(
             intersections[path_index].t = t_min;
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = normal;
+            intersections[path_index].outside = hitOutside;
         }
     }
 }
@@ -278,6 +321,169 @@ __global__ void buildMaterialKeys(
     }
 }
 
+__device__ bool visibleToLight(
+    glm::vec3 origin,
+    glm::vec3 direction,
+    float lightDistance,
+    int lightIndex,
+    Geom* geoms,
+    int geoms_size)
+{
+    Ray shadowRay;
+    shadowRay.origin = origin;
+    shadowRay.direction = direction;
+
+    for (int i = 0; i < geoms_size; i++)
+    {
+        if (i == lightIndex)
+        {
+            continue;
+        }
+
+        Geom& geom = geoms[i];
+
+        glm::vec3 tmpIntersect;
+        glm::vec3 tmpNormal;
+        bool tmpOutside = true;
+
+        float t = -1.0f;
+
+        if (geom.type == CUBE)
+        {
+            t = boxIntersectionTest(
+                geom,
+                shadowRay,
+                tmpIntersect,
+                tmpNormal,
+                tmpOutside
+            );
+        }
+        else if (geom.type == SPHERE)
+        {
+            t = sphereIntersectionTest(
+                geom,
+                shadowRay,
+                tmpIntersect,
+                tmpNormal,
+                tmpOutside
+            );
+        }
+
+        if (t > 0.0f && t < lightDistance - 0.002f)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+__device__ glm::vec3 sampleDirectLighting(
+    PathSegment& pathSegment,
+    glm::vec3 intersectPoint,
+    glm::vec3 surfaceNormal,
+    const Material& surfaceMaterial,
+    Geom* geoms,
+    int geoms_size,
+    Material* materials,
+    bool useLowDiscrepancy,
+    int iter,
+    int depth,
+    thrust::default_random_engine& rng)
+{
+    int lightIndex = -1;
+
+    for (int i = 0; i < geoms_size; i++)
+    {
+        if (geoms[i].type == CUBE &&
+            materials[geoms[i].materialid].emittance > 0.0f)
+        {
+            lightIndex = i;
+            break;
+        }
+    }
+
+    if (lightIndex == -1)
+    {
+        return glm::vec3(0.0f);
+    }
+
+    Geom light = geoms[lightIndex];
+    Material lightMaterial = materials[light.materialid];
+
+    float u;
+    float v;
+
+    if (useLowDiscrepancy)
+    {
+        unsigned int sampleIndex = (unsigned int)(iter + 1);
+        glm::vec2 sample = halton2D(sampleIndex, 5, 7);
+
+        unsigned int seed = (unsigned int)pathSegment.pixelIndex ^ ((unsigned int)depth * 0x9e3779b9u) ^ 0x85ebca6bu;
+
+        sample.x += hashToUnitFloat(seed);
+        sample.y += hashToUnitFloat(seed ^ 0xc2b2ae35u);
+
+        sample.x -= floorf(sample.x);
+        sample.y -= floorf(sample.y);
+
+        u = sample.x - 0.5f;
+        v = sample.y - 0.5f;
+    }
+    else
+    {
+        thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        u = u01(rng) - 0.5f;
+        v = u01(rng) - 0.5f;
+    }
+
+    glm::vec3 localLightPoint( u, -0.5f, v);
+
+    glm::vec3 lightPoint = multiplyMV(light.transform, glm::vec4(localLightPoint, 1.0f));
+
+    glm::vec3 lightNormal = glm::normalize( multiplyMV( light.invTranspose, glm::vec4(0.0f, -1.0f, 0.0f, 0.0f)));
+
+    glm::vec3 toLight = lightPoint - intersectPoint;
+
+    float distanceSquared = glm::dot(toLight, toLight);
+
+    float distance = sqrtf(distanceSquared);
+
+    glm::vec3 lightDirection = toLight / distance;
+
+    float surfaceCos = fmaxf( glm::dot(surfaceNormal, lightDirection), 0.0f);
+
+    float lightCos = fmaxf( glm::dot(lightNormal, -lightDirection), 0.0f);
+
+    if (surfaceCos <= 0.0f ||
+        lightCos <= 0.0f)
+    {
+        return glm::vec3(0.0f);
+    }
+
+    glm::vec3 shadowOrigin =
+        intersectPoint +
+        surfaceNormal * 0.001f;
+
+    if (!visibleToLight(shadowOrigin, lightDirection, distance, lightIndex, geoms, geoms_size))
+    {
+        return glm::vec3(0.0f);
+    }
+
+    float lightArea = fabsf(light.scale.x * light.scale.z);
+
+    glm::vec3 emittedLight = lightMaterial.color * lightMaterial.emittance;
+
+    glm::vec3 directContribution = pathSegment.color * surfaceMaterial.color * emittedLight *
+        (
+            surfaceCos *
+            lightCos *
+            lightArea /
+            (PI * distanceSquared)
+        );
+
+    return directContribution;
+}
 // LOOK: "fake" shader demonstrating what you might do with the info in
 // a ShadeableIntersection, as well as how to use thrust's random number
 // generator. Observe that since the thrust random number generator basically
@@ -289,10 +495,14 @@ __global__ void buildMaterialKeys(
 // bump mapping.
 __global__ void shadeFakeMaterial(
     int iter,
+    int depth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
-    Material* materials)
+    Material* materials,
+    Geom* geoms,
+    int geoms_size,
+    glm::vec3* image)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths && pathSegments[idx].remainingBounces > 0)
@@ -308,7 +518,16 @@ __global__ void shadeFakeMaterial(
 
             // If the material indicates that the object was a light, "light" the ray
             if (material.emittance > 0.0f) {
-                pathSegments[idx].color *= (materialColor * material.emittance);
+                if (DIRECT_LIGHTING == 0 ||
+                    pathSegments[idx].allowEmission)
+                {
+                    pathSegments[idx].color *=materialColor * material.emittance;
+                }
+                else
+                {
+                    pathSegments[idx].color = glm::vec3(0.0f);
+                }
+
                 pathSegments[idx].remainingBounces = 0;
             }
             // Otherwise, do some pseudo-lighting computation. This is actually more
@@ -322,11 +541,37 @@ __global__ void shadeFakeMaterial(
                         pathSegments[idx].pixelIndex,
                         pathSegments[idx].remainingBounces
                     );
+
+                if (DIRECT_LIGHTING == 1 &&
+                    material.hasRefractive <= 0.0f)
+                {
+                    glm::vec3 directContribution =
+                        sampleDirectLighting(
+                            pathSegments[idx],
+                            intersectPoint,
+                            intersection.surfaceNormal,
+                            material,
+                            geoms,
+                            geoms_size,
+                            materials,
+                            LOW_DISCREPANCY_SAMPLING == 1,
+                            iter,
+                            depth,
+                            rng
+                        );
+
+                    image[pathSegments[idx].pixelIndex] += directContribution;
+                }
                 scatterRay(
                     pathSegments[idx],
                     intersectPoint,
                     intersection.surfaceNormal,
                     material,
+                    intersection.outside,
+                    REFRACTION == 1,
+                    LOW_DISCREPANCY_SAMPLING == 1,
+                    iter,
+                    depth,
                     rng
                 );
                 pathSegments[idx].remainingBounces --;
@@ -334,6 +579,34 @@ __global__ void shadeFakeMaterial(
                 if (pathSegments[idx].remainingBounces == 0)
                 {
                     pathSegments[idx].color = glm::vec3(0.0f);
+                }
+                else if (RUSSIAN_ROULETTE == 1 && depth >= RR_START_DEPTH)
+                {
+                    float survivalProbability = fmaxf(
+                        pathSegments[idx].color.x,
+                        fmaxf(
+                            pathSegments[idx].color.y,
+                            pathSegments[idx].color.z
+                        )
+                    );
+
+                    survivalProbability = fminf(
+                        0.95f,
+                        fmaxf(0.05f, survivalProbability)
+                    );
+
+                    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+                    float rouletteSample = u01(rng);
+
+                    if (rouletteSample > survivalProbability)
+                    {
+                        pathSegments[idx].color = glm::vec3(0.0f);
+                        pathSegments[idx].remainingBounces = 0;
+                    }
+                    else
+                    {
+                        pathSegments[idx].color /= survivalProbability;
+                    }
                 }
 
             }
@@ -502,10 +775,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
         shadeFakeMaterial<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
+            depth,
             num_paths,
             dev_intersections,
             dev_paths,
-            dev_materials
+            dev_materials,
+            dev_geoms,
+            hst_scene->geoms.size(),
+            dev_image
         );
 
         checkCUDAError("shade material");
