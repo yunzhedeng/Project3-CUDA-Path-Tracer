@@ -37,9 +37,11 @@
 
 #define REFRACTION 0
 
-#define DIRECT_LIGHTING 1
+#define DIRECT_LIGHTING 0
 
-#define LOW_DISCREPANCY_SAMPLING 1
+#define LOW_DISCREPANCY_SAMPLING 0
+
+#define MOTION_BLUR 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -202,6 +204,8 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.ray.origin = cam.position;
         segment.ray.direction = primaryDirection;
 
+        segment.ray.time = MOTION_BLUR ? u01(rng) : 0.0f;
+
         if (DEPTH_OF_FIELD == 1)
         {
             float lensU = u01(rng);
@@ -263,14 +267,22 @@ __global__ void computeIntersections(
         {
             Geom& geom = geoms[i];
             bool tmpOutside = true;
+            
+            Ray motionRay = pathSegment.ray;
+            glm::vec3 motionOffset = glm::vec3(0.0f);
 
+            if (MOTION_BLUR == 1)
+            {
+                motionOffset = geom.motion * pathSegment.ray.time;
+                motionRay.origin -= motionOffset;
+            }
             if (geom.type == CUBE)
             {
-                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
+                t = boxIntersectionTest(geom, motionRay, tmp_intersect, tmp_normal, tmpOutside);
             }
             else if (geom.type == SPHERE)
             {
-                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
+                t = sphereIntersectionTest(geom, motionRay, tmp_intersect, tmp_normal, tmpOutside);
             }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 

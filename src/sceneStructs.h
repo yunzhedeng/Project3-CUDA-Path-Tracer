@@ -19,6 +19,7 @@ struct Ray
 {
     glm::vec3 origin;
     glm::vec3 direction;
+    float time;
 };
 
 struct Geom
@@ -28,6 +29,7 @@ struct Geom
     glm::vec3 translation;
     glm::vec3 rotation;
     glm::vec3 scale;
+    glm::vec3 motion;
     glm::mat4 transform;
     glm::mat4 inverseTransform;
     glm::mat4 invTranspose;
