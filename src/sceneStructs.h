@@ -12,7 +12,9 @@
 enum GeomType
 {
     SPHERE,
-    CUBE
+    CUBE,
+    TORUS,
+    ROUNDED_BOX
 };
 
 struct Ray

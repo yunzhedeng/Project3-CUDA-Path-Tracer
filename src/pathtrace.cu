@@ -145,6 +145,12 @@ void pathtraceInit(Scene* scene)
     checkCUDAError("pathtraceInit");
 }
 
+void pathtraceRestoreImage(const glm::vec3* image, int pixelcount)
+{
+    cudaMemcpy(dev_image, image, pixelcount * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+    checkCUDAError("restore checkpoint image");
+}
+
 void pathtraceFree()
 {
     cudaFree(dev_image);  // no-op if dev_image is null

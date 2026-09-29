@@ -1,5 +1,24 @@
 #include "intersections.h"
 
+__host__ __device__ float torusSDF(glm::vec3 p)
+{
+    const float majorRadius = 0.35f;
+    const float minorRadius = 0.15f;
+    glm::vec2 q(glm::length(glm::vec2(p.x, p.z)) - majorRadius, p.y);
+    return glm::length(q) - minorRadius;
+}
+
+__host__ __device__ glm::vec3 torusNormal(glm::vec3 p)
+{
+    const float e = 0.001f;
+
+    float dx = torusSDF(p + glm::vec3(e, 0.0f, 0.0f)) - torusSDF(p - glm::vec3(e, 0.0f, 0.0f));
+    float dy = torusSDF(p + glm::vec3(0.0f, e, 0.0f)) - torusSDF(p - glm::vec3(0.0f, e, 0.0f));
+    float dz = torusSDF(p + glm::vec3(0.0f, 0.0f, e)) - torusSDF(p - glm::vec3(0.0f, 0.0f, e));
+
+    return glm::normalize(glm::vec3(dx, dy, dz));
+}
+
 __host__ __device__ float boxIntersectionTest(
     Geom box,
     Ray r,
