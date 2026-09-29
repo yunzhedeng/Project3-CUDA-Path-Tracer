@@ -37,11 +37,11 @@
 
 #define REFRACTION 0
 
-#define DIRECT_LIGHTING 0
+#define DIRECT_LIGHTING 1
 
 #define LOW_DISCREPANCY_SAMPLING 0
 
-#define MOTION_BLUR 1
+#define MOTION_BLUR 0
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -290,6 +290,14 @@ __global__ void computeIntersections(
             {
                 t = sphereIntersectionTest(geom, motionRay, tmp_intersect, tmp_normal, tmpOutside);
             }
+            else if (geom.type == TORUS)
+            {
+                t = torusIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
+            }
+            else if (geom.type == MENGER)
+            {
+                t = mengerIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
+            }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 
             // Compute the minimum t from the intersection tests to determine what
@@ -511,6 +519,38 @@ __device__ glm::vec3 sampleDirectLighting(
 // Note that this shader does NOT do a BSDF evaluation!
 // Your shaders should handle that - this can allow techniques such as
 // bump mapping.
+
+__device__ glm::vec3 getProceduralTextureColor(const Material& material, glm::vec3 p)
+{
+    if (material.textureType == TEXTURE_NONE) 
+        return material.color;
+
+    float scale = material.textureScale;
+
+    if (material.textureType == TEXTURE_CHECKER)
+    {
+        int ix = (int)floorf(p.x * scale);
+        int iy = (int)floorf(p.y * scale);
+        int iz = (int)floorf(p.z * scale);
+
+        int checker = ((ix + iy + iz) % 2 + 2) % 2;
+
+        if (checker == 0) return material.color;
+        return material.textureColor;
+    }
+
+    if (material.textureType == TEXTURE_STRIPES)
+    {
+        int stripe = (int)floorf(p.y * scale);
+        stripe = (stripe % 2 + 2) % 2;
+
+        if (stripe == 0) return material.color;
+        return material.textureColor;
+    }
+
+    return material.color;
+}
+
 __global__ void shadeFakeMaterial(
     int iter,
     int depth,
@@ -553,6 +593,9 @@ __global__ void shadeFakeMaterial(
             // TODO: replace this! you should be able to start with basically a one-liner
             else {
                 glm::vec3 intersectPoint = getPointOnRay(pathSegments[idx].ray, intersection.t);
+                
+                material.color = getProceduralTextureColor(material, intersectPoint);
+                
                 thrust::default_random_engine rng =
                     makeSeededRandomEngine(
                         iter,

@@ -19,6 +19,135 @@ __host__ __device__ glm::vec3 torusNormal(glm::vec3 p)
     return glm::normalize(glm::vec3(dx, dy, dz));
 }
 
+__host__ __device__ float boxSDF(glm::vec3 p, glm::vec3 halfSize)
+{
+    glm::vec3 q = glm::abs(p) - halfSize;
+    glm::vec3 outside(fmaxf(q.x, 0.0f), fmaxf(q.y, 0.0f), fmaxf(q.z, 0.0f));
+
+    float outsideDistance = glm::length(outside);
+    float insideDistance = fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.0f);
+
+    return outsideDistance + insideDistance;
+}
+
+__host__ __device__ float mengerSDF(glm::vec3 p)
+{
+    const float holeRadius = 1.0f / 6.0f;
+
+    float outerBox = boxSDF(p, glm::vec3(0.5f));
+
+    float holeX = boxSDF(p, glm::vec3(0.6f, holeRadius, holeRadius));
+    float holeY = boxSDF(p, glm::vec3(holeRadius, 0.6f, holeRadius));
+    float holeZ = boxSDF(p, glm::vec3(holeRadius, holeRadius, 0.6f));
+
+    float holes = fminf(holeX, fminf(holeY, holeZ));
+
+    return fmaxf(outerBox, -holes);
+}
+
+__host__ __device__ glm::vec3 mengerNormal(glm::vec3 p)
+{
+    const float e = 0.001f;
+
+    float dx = mengerSDF(p + glm::vec3(e, 0.0f, 0.0f)) - mengerSDF(p - glm::vec3(e, 0.0f, 0.0f));
+    float dy = mengerSDF(p + glm::vec3(0.0f, e, 0.0f)) - mengerSDF(p - glm::vec3(0.0f, e, 0.0f));
+    float dz = mengerSDF(p + glm::vec3(0.0f, 0.0f, e)) - mengerSDF(p - glm::vec3(0.0f, 0.0f, e));
+
+    return glm::normalize(glm::vec3(dx, dy, dz));
+}
+
+__host__ __device__ float mengerIntersectionTest(
+    Geom menger,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside)
+{
+    Ray q;
+    q.origin = multiplyMV(menger.inverseTransform, glm::vec4(r.origin, 1.0f));
+    q.direction = glm::normalize(multiplyMV(menger.inverseTransform, glm::vec4(r.direction, 0.0f)));
+
+    float t = 0.001f;
+
+    for (int i = 0; i < 128; i++)
+    {
+        glm::vec3 p = q.origin + t * q.direction;
+        float distance = mengerSDF(p);
+
+        if (fabsf(distance) < 0.001f)
+        {
+            intersectionPoint = multiplyMV(menger.transform, glm::vec4(p, 1.0f));
+
+            glm::vec3 objectNormal = mengerNormal(p);
+            normal = glm::normalize(multiplyMV(menger.invTranspose, glm::vec4(objectNormal, 0.0f)));
+
+            outside = mengerSDF(q.origin) > 0.0f;
+
+            if (!outside)
+            {
+                normal = -normal;
+            }
+
+            return glm::length(r.origin - intersectionPoint);
+        }
+
+        t += fabsf(distance);
+
+        if (t > 10.0f)
+        {
+            break;
+        }
+    }
+
+    return -1.0f;
+}
+
+__host__ __device__ float torusIntersectionTest(
+    Geom torus,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside)
+{
+    Ray q;
+    q.origin = multiplyMV(torus.inverseTransform, glm::vec4(r.origin, 1.0f));
+    q.direction = glm::normalize(multiplyMV(torus.inverseTransform, glm::vec4(r.direction, 0.0f)));
+
+    float t = 0.001f;
+
+    for (int i = 0; i < 128; i++)
+    {
+        glm::vec3 p = q.origin + t * q.direction;
+        float distance = torusSDF(p);
+
+        if (fabsf(distance) < 0.001f)
+        {
+            intersectionPoint = multiplyMV(torus.transform, glm::vec4(p, 1.0f));
+
+            glm::vec3 objectNormal = torusNormal(p);
+            normal = glm::normalize(multiplyMV(torus.invTranspose, glm::vec4(objectNormal, 0.0f)));
+
+            outside = torusSDF(q.origin) > 0.0f;
+
+            if (!outside)
+            {
+                normal = -normal;
+            }
+
+            return glm::length(r.origin - intersectionPoint);
+        }
+
+        t += fabsf(distance);
+
+        if (t > 10.0f)
+        {
+            break;
+        }
+    }
+
+    return -1.0f;
+}
+
 __host__ __device__ float boxIntersectionTest(
     Geom box,
     Ray r,

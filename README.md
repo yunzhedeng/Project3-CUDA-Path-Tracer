@@ -651,3 +651,307 @@ The low discrepancy sampling scheme works especially well for GPU rendering sinc
 #### Further Optimization
 
 Diffuse hemisphere sampling is currently achieved using a Halton sequence based on bases 2 and 3. There are several other ways in which the current approach can be enhanced by making use of Cranley-Patterson rotation, Owen scrambling, or other forms of low-discrepancy sequences. It may also be beneficial to extend low-discrepancy sampling from the current use on diffuse bounce direction sampling to camera sampling, depth of field lens sampling, or even direct light sampling.
+
+### 2.6 Motion Blur
+
+Motion blur was implemented by assigning each camera path a random time within a normalized shutter interval `[0, 1]`. Moving objects are assigned a translation vector that describes how far they move during this interval. Each ray stores its sampled time:
+
+```cpp
+segment.ray.time = MOTION_BLUR ? u01(rng) : 0.0f;
+```
+
+The time is generated only when the primary camera ray is created and remains unchanged throughout all subsequent bounces of the same path. This ensures that every bounce observes the scene at the same instant in time. Object motion can be specified directly in the scene file:
+
+```json
+"MOTION": [3.0, 0.0, 0.0]
+```
+
+For example, this specifies that the object moves three scene units along the X axis during the shutter interval. Instead of rebuilding the object's transformation matrices for every ray and every sampled time, the intersection calculation uses relative motion. The object's displacement at the ray's sampled time is:
+
+```cpp
+motionOffset = geom.motion * pathSegment.ray.time;
+```
+
+A temporary ray is then translated in the opposite direction:
+
+```cpp
+Ray motionRay = pathSegment.ray;
+motionRay.origin -= motionOffset;
+```
+
+Moving an object by `+motionOffset` is equivalent, for intersection testing, to keeping the object stationary and translating the ray by `-motionOffset`. This allows the existing sphere and box intersection routines to be reused without rebuilding object transforms.
+
+#### Visual and Performance Comparison
+
+The following comparison uses the same scene and rendering settings, with the only difference being whether motion blur is enabled. The sphere moves horizontally along the X axis.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Motion Blur OFF</b><br><br>
+<img src="./own_img/motion_blur_off.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Motion Blur ON</b><br><br>
+<img src="./own_img/motion_blur_on.png" width="100%">
+</td>
+</tr>
+</table>
+
+With motion blur disabled, every ray observes the sphere at its original position, producing a sharp silhouette. With motion blur enabled, different paths observe the sphere at different positions during the shutter interval. After many samples are accumulated, the sphere becomes visibly stretched and blurred along its horizontal direction of motion. The floor shadow also becomes wider and softer because the moving object occupies different positions across the sampled times.
+
+| Motion Blur | Time / Frame |  FPS |
+| ----------- | -----------: | ---: |
+| OFF         |    41. 519ms | 24.1 |
+| ON          |    40.659 ms | 24.6 |
+
+#### Analysis
+
+The resulting motion-blurred image depicts a distinct horizontal motion blur aligned with the motion vector defined by the object itself. The use of a motion vector on the X axis causes the silhouette of the sphere to grow horizontally more than vertically.
+
+As for the algorithm used, it does not duplicate the scene for each time sample, instead using the same static geometry and just changing the ray origin relative to the object's movement. This way the algorithm remains fairly simple while allowing each path to sample the motion at a different place.
+
+In addition to the increased processing requirements caused by storing a time parameter for each ray and computing an offset for intersection tests, there is no additional path tracing bounce needed just for motion blur.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+Motion blur can be naturally implemented using GPU path tracing since each camera path has an independent shutter time to be sampled. Thousands of rays can thus sample different shutter times at the same time without any need for thread coordination. A CPU implementation can utilize the same temporal sampling technique but will have fewer camera paths evaluated at once. Another benefit of using the relative motion intersection technique is that complete object transformation matrices do not need to be calculated per ray.
+
+#### Further Optimization
+
+Linear translations may be done currently while in a normalized shutter period. A more enhanced way to achieve this would be by allowing rotation of objects, non-linear paths and different timings for shutter opening and shutter closing. Static objects could move faster since the calculation for motion would not need to be done for objects that have zero motion vectors.
+
+### 2.7 Restartable Path Tracing
+
+A checkpoint system was implemented so that a long-running path-tracing session can be stopped and resumed later without discarding previously accumulated samples.
+
+The checkpoint stores a small header containing the image resolution and current iteration:
+
+```cpp
+struct CheckpointHeader
+{
+    int width;
+    int height;
+    int iteration;
+};
+```
+
+When a checkpoint is saved, the current iteration and accumulated floating-point image buffer are written directly to a binary file:
+
+```cpp
+file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+file.write(reinterpret_cast<const char*>(renderState->image.data()), renderState->image.size() * sizeof(glm::vec3));
+```
+
+The checkpoint can be saved interactively by pressing `C`.
+
+When loading, the stored resolution is first checked against the current scene:
+
+```cpp
+if (header.width != width || header.height != height)
+{
+    std::cerr << "Checkpoint resolution does not match current scene." << std::endl;
+    return;
+}
+```
+
+The accumulated image samples and saved iteration are then restored:
+
+```cpp
+iteration = header.iteration;
+pathtraceRestoreImage(renderState->image.data(), width * height);
+```
+
+Since rendering continues on the GPU, the recovered CPU image must also be copied back into the CUDA accumulation buffer:
+
+```cpp
+void pathtraceRestoreImage(const glm::vec3* image, int pixelcount)
+{
+    cudaMemcpy(dev_image, image, pixelcount * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+}
+```
+
+The checkpoint can be loaded interactively by pressing `L`.
+
+#### Visual and Performance Comparison
+
+The checkpoint system was tested by saving a rendering session at iteration 54, completely closing the renderer, restarting the same scene, and loading the saved checkpoint. The terminal output confirms that the checkpoint was saved at iteration 54 and that the new application instance successfully restored the same iteration.
+
+<p align="center">
+<img src="own_img/restartable_checkpoint.png" width="100%">
+</p>
+
+Unlike rendering features that modify the image itself, restartable path tracing does not change the visual result. Its purpose is to preserve previously accumulated rendering work across application sessions.
+
+There is also no additional steady-state per-frame rendering cost. Checkpoint operations only occur when explicitly requested by the user. Saving performs a binary write of the accumulated image buffer and iteration state, while loading performs a binary read followed by one host-to-device `cudaMemcpy` to restore the CUDA accumulation buffer. Therefore, the feature introduces only a one-time I/O cost when saving or restoring a session.
+
+#### Analysis
+
+The test managed to preserve the rendering process at iteration 54 and restore the very same iteration when the program was relaunched. It is essential to save both the iteration number and the total image value since the current pixel color is calculated using the samples obtained up until now.
+
+Saving only the iteration number will result in an erroneous picture since the radiance accumulated previously will be lost. The same way, saving only the image value without the iteration number means using the wrong normalization coefficient.
+
+The implementation therefore restores both pieces of state: accumulated radiance butter & current iteration count. This allows long renders to be divided across multiple program executions without losing previous sampling work.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+The checkpoint file itself is independent of the hardware because the accumulated image is saved as regular floating-point RGB values in CPU memory. This means that a CPU version of the path tracer could use almost identical saving/loading of checkpoints. The extra step for the CUDA version will be loading the accumulated image back into the GPU memory. Once the checkpoint file is loaded into the CPU buffer, the memory transfer will restore `dev_image`. Because this will happen just once at checkpoint loading time, there won't be any extra cost per render iteration.
+
+#### Further Optimization
+
+The current checkpoint saves the resolution of the image, the number of iterations, and the samples of the images saved so far. The next possible checkpoints would include other renderer settings like camera settings, the state of the random number generator, the scene definition, or acceleration structures. A scene identifier or hash may be saved in the checkpoint header as well, so that the renderer will be able to discard a checkpoint generated for another scene even if both scenes have the same resolution. Version numbers may also be saved in the checkpoint files to make sure the format is still compatible.
+
+### 2.8 Procedural Shapes and Textures
+
+I extended the renderer with two procedurally defined complex shapes and two procedurally generated surface textures. Unlike file-loaded meshes or image textures, both the geometry and the surface patterns are evaluated directly from mathematical functions at render time. The two procedural shapes are **Torus** and **Level-1 Menger Sponge**. The two procedural textures are **Checkerboard** and **Stripes**.
+
+#### Procedural Torus
+
+The torus is represented using a signed distance function (SDF). Two radii define the shape: the major radius controls the distance from the torus center to the center of the tube, while the minor radius controls the thickness of the tube.
+
+```cpp
+__host__ __device__ float torusSDF(glm::vec3 p)
+{
+    const float majorRadius = 0.35f;
+    const float minorRadius = 0.15f;
+
+    glm::vec2 q(glm::length(glm::vec2(p.x, p.z)) - majorRadius, p.y);
+
+    return glm::length(q) - minorRadius;
+}
+```
+
+The SDF returns a positive value outside the torus, approximately zero on the surface, and a negative value inside the geometry. Ray intersections are evaluated using sphere tracing. Starting from the ray origin, the renderer repeatedly evaluates the SDF and advances the ray by the returned distance:
+
+```cpp
+glm::vec3 p = q.origin + t * q.direction;
+float distance = torusSDF(p);
+
+if (fabsf(distance) < 0.001f)
+{
+    // surface hit
+}
+
+t += fabsf(distance);
+```
+
+This allows the renderer to intersect the torus without loading or tessellating a mesh.
+
+#### Procedural Menger Sponge
+
+The second procedural shape is a Level-1 Menger Sponge. It begins with a unit cube and subtracts three perpendicular rectangular tunnels through the center. A standard box SDF is first used as the basic building block:
+
+```cpp
+__host__ __device__ float boxSDF(glm::vec3 p, glm::vec3 halfSize)
+{
+    glm::vec3 q = glm::abs(p) - halfSize;
+    glm::vec3 outside(fmaxf(q.x, 0.0f), fmaxf(q.y, 0.0f), fmaxf(q.z, 0.0f));
+
+    float outsideDistance = glm::length(outside);
+    float insideDistance = fminf(fmaxf(q.x, fmaxf(q.y, q.z)), 0.0f);
+
+    return outsideDistance + insideDistance;
+}
+```
+
+The three tunnels are combined using an SDF union, and then subtracted from the outer cube:
+
+```cpp
+float outerBox = boxSDF(p, glm::vec3(0.5f));
+
+float holeX = boxSDF(p, glm::vec3(0.6f, holeRadius, holeRadius));
+float holeY = boxSDF(p, glm::vec3(holeRadius, 0.6f, holeRadius));
+float holeZ = boxSDF(p, glm::vec3(holeRadius, holeRadius, 0.6f));
+
+float holes = fminf(holeX, fminf(holeY, holeZ));
+
+return fmaxf(outerBox, -holes);
+```
+
+This construction creates the characteristic center and face openings of the first Menger subdivision without explicitly creating individual cubes. Both procedural shapes use finite differences to estimate their surface normals from their SDF:
+
+```cpp
+float dx = sdf(p + glm::vec3(e, 0.0f, 0.0f)) - sdf(p - glm::vec3(e, 0.0f, 0.0f));
+float dy = sdf(p + glm::vec3(0.0f, e, 0.0f)) - sdf(p - glm::vec3(0.0f, e, 0.0f));
+float dz = sdf(p + glm::vec3(0.0f, 0.0f, e)) - sdf(p - glm::vec3(0.0f, 0.0f, e));
+
+return glm::normalize(glm::vec3(dx, dy, dz));
+```
+
+#### Procedural Textures
+
+Procedural textures are evaluated directly from the intersection position rather than sampled from an image file. Each material can specify a texture type, a secondary color, and a texture scale:
+
+```json
+"checker": {
+    "TYPE": "Diffuse",
+    "RGB": [0.95, 0.95, 0.95],
+    "TEXTURE": "checker",
+    "TEXTURE_RGB": [0.20, 0.20, 0.20],
+    "TEXTURE_SCALE": 5.0
+}
+```
+
+The checkerboard texture divides space into alternating cells:
+
+```cpp
+int ix = (int)floorf(p.x * scale);
+int iy = (int)floorf(p.y * scale);
+int iz = (int)floorf(p.z * scale);
+
+int checker = ((ix + iy + iz) % 2 + 2) % 2;
+
+if (checker == 0) return material.color;
+return material.textureColor;
+```
+
+The stripe texture alternates colors along the Y direction:
+
+```cpp
+int stripe = (int)floorf(p.y * scale);
+stripe = (stripe % 2 + 2) % 2;
+
+if (stripe == 0) return material.color;
+return material.textureColor;
+```
+
+The procedural color is evaluated at the surface intersection before BSDF scattering:
+
+```cpp
+material.color = getProceduralTextureColor(material, intersectPoint);
+```
+
+Therefore, the same texture implementation can be applied to different geometry types without changing the intersection or shading algorithms.
+
+#### Visual and Performance Comparison
+
+To demonstrate that the procedural textures are independent of the underlying procedural geometry, I rendered the same scene twice while keeping the camera, object transforms, lighting, and rendering configuration unchanged. Direct lighting was enabled in both renders to make the Torus, Menger Sponge, and their surface patterns easier to distinguish. The only difference between the two renders is the assignment of the checkerboard and stripe materials. In the first render, the Torus uses the checkerboard texture while the Menger Sponge uses stripes. In the second render, the assignments are reversed.
+
+<table>
+<tr>
+<td align="center" width="50%">
+<b>Torus: Checker / Menger: Stripes</b><br><br>
+<img src="own_img/procedural_checker_torus.png" width="100%">
+</td>
+<td align="center" width="50%">
+<b>Torus: Stripes / Menger: Checker</b><br><br>
+<img src="own_img/procedural_stripes_torus.png" width="100%">
+</td>
+</tr>
+</table>
+
+Material swaps are proof that neither of these textures is intrinsically bound to a particular procedural primitive. The texture routines are calculated from the point of surface intersection and thus can be used with any geometry. Procedural scene rendering with direct light enabled took around **88.587 ms/frame (11.3 FPS)**. This data point was not intended to be a controlled feature comparison but rather serves as a reference point. Procedural geometry must be more costly than analytical sphere and cube intersections because each Torus and Menger intersection can involve several SDF calculations.
+
+#### Analysis
+
+The results prove that procedural geometry and procedural textures are independent of each other. The torus and menger sponge objects are procedurally constructed by using SDFs and sphere tracing methods. On the other hand, the checkerboard and stripes are procedurally calculated based on the surface intersection point. It can be seen that when the two textures are switched between the two objects, the results will only change in the appearance of the surface.
+
+The high performance cost is due to the procedural geometry not the textures. This means that torus and menger intersection involves several SDFs evaluations through sphere tracing while the checkers and stripes need just some mathematical operations. In order to compare the shapes and textures, direct lighting is turned on in both images.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+Rendering of procedural SDFs on the GPU is ideal due to the fact that each running path executes its own independent sphere tracing. The rendering of multiple rays can therefore take place simultaneously since there is no dependency between different paths. While the algorithm would employ the same formulas for SDF and the marching process on the CPU, it would evaluate significantly fewer rays at once. There is however an issue of warping divergence, since the sphere tracing steps per ray can be different for adjacent GPU threads. Procedural texture generation is highly appropriate to execute on the GPU, because of the independent calculation of texture color by each shading thread.
+
+#### Further Optimization
+
+The existing implementation of the SDF intersection has a set limit of 128 tracing steps and a fixed threshold for the surface. This can be improved by applying bounding volumes to procedural objects to trace spheres only if the initial hit occurs in the bounding volume of an object. The Level-1 Menger Sponge can be further subdivided into higher levels and thus create a more complex fractal structure. Some SDF operations might also include smooth unions, twists, repetitions, and other CSF operations. The current implementation of procedural textures relies on hit position in the world space coordinates. The next step might involve object space evaluation or even UV mapping.

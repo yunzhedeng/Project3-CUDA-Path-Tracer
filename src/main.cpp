@@ -557,11 +557,13 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
                 saveImage();
                 break;
             case GLFW_KEY_SPACE:
+            {
                 camchanged = true;
                 renderState = &scene->state;
                 Camera& cam = renderState->camera;
                 cam.lookAt = ogLookAt;
                 break;
+            }
             case GLFW_KEY_C:
                 saveCheckpoint();
                 break;

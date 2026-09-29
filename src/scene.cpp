@@ -67,6 +67,34 @@ void Scene::loadFromJSON(const std::string& jsonName)
             newMaterial.hasRefractive = 1.0f;
             newMaterial.indexOfRefraction = p["IOR"];
         }
+        newMaterial.textureType = TEXTURE_NONE;
+        newMaterial.textureColor = glm::vec3(0.0f);
+        newMaterial.textureScale = 1.0f;
+
+        if (p.contains("TEXTURE"))
+        {
+            std::string texture = p["TEXTURE"];
+
+            if (texture == "checker")
+            {
+                newMaterial.textureType = TEXTURE_CHECKER;
+            }
+            else if (texture == "stripes")
+            {
+                newMaterial.textureType = TEXTURE_STRIPES;
+            }
+
+            if (p.contains("TEXTURE_RGB"))
+            {
+                const auto& texColor = p["TEXTURE_RGB"];
+                newMaterial.textureColor = glm::vec3(texColor[0], texColor[1], texColor[2]);
+            }
+
+            if (p.contains("TEXTURE_SCALE"))
+            {
+                newMaterial.textureScale = p["TEXTURE_SCALE"];
+            }
+        }
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
     }
@@ -87,8 +115,9 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             newGeom.type = TORUS;
         }
-        else if (type == "rounded_box"){
-            newGeom.type = ROUNDED_BOX;
+        else if (type == "menger")
+        {
+            newGeom.type = MENGER;
         }
         newGeom.materialid = MatNameToID[p["MATERIAL"]];
         const auto& trans = p["TRANS"];

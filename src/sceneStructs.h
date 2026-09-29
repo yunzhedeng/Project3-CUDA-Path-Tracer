@@ -14,7 +14,7 @@ enum GeomType
     SPHERE,
     CUBE,
     TORUS,
-    ROUNDED_BOX
+    MENGER
 };
 
 struct Ray
@@ -37,6 +37,13 @@ struct Geom
     glm::mat4 invTranspose;
 };
 
+enum ProceduralTextureType
+{
+    TEXTURE_NONE = 0,
+    TEXTURE_CHECKER = 1,
+    TEXTURE_STRIPES = 2
+};
+
 struct Material
 {
     glm::vec3 color;
@@ -49,6 +56,9 @@ struct Material
     float hasRefractive;
     float indexOfRefraction;
     float emittance;
+    int textureType;
+    glm::vec3 textureColor;
+    float textureScale;
 };
 
 struct Camera
