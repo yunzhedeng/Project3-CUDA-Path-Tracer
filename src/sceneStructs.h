@@ -41,7 +41,15 @@ enum ProceduralTextureType
 {
     TEXTURE_NONE = 0,
     TEXTURE_CHECKER = 1,
-    TEXTURE_STRIPES = 2
+    TEXTURE_STRIPES = 2,
+    TEXTURE_FILE = 3
+};
+
+struct TextureData
+{
+    int width;
+    int height;
+    std::vector<glm::vec3> pixels;
 };
 
 struct Material
@@ -59,6 +67,16 @@ struct Material
     int textureType;
     glm::vec3 textureColor;
     float textureScale;
+
+    int textureWidth;
+    int textureHeight;
+    int textureIndex;
+    int textureOffset;
+
+    int bumpWidth;
+    int bumpHeight;
+    int bumpOffset;
+    float bumpStrength;
 };
 
 struct Camera

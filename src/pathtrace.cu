@@ -43,6 +43,12 @@
 
 #define MOTION_BLUR 0
 
+#define PROCEDURAL_SHAPES_TEXTURES 0
+
+#define FILE_TEXTURE_MAPPING 0
+
+#define BUMP_MAPPING 0
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -107,6 +113,7 @@ static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
+static glm::vec3* dev_texturePixels = NULL;
 static int* dev_material_ids = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
@@ -134,6 +141,12 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
 
+    if (!scene->texturePixels.empty())
+    {
+        cudaMalloc(&dev_texturePixels, scene->texturePixels.size() * sizeof(glm::vec3));
+        cudaMemcpy(dev_texturePixels, scene->texturePixels.data(), scene->texturePixels.size() * sizeof(glm::vec3), cudaMemcpyHostToDevice);
+    }
+
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
@@ -159,6 +172,7 @@ void pathtraceFree()
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
     cudaFree(dev_material_ids);
+    cudaFree(dev_texturePixels);
     // TODO: clean up any extra device memory you created
 
     checkCUDAError("pathtraceFree");
@@ -282,6 +296,8 @@ __global__ void computeIntersections(
                 motionOffset = geom.motion * pathSegment.ray.time;
                 motionRay.origin -= motionOffset;
             }
+            t = -1.0f;
+
             if (geom.type == CUBE)
             {
                 t = boxIntersectionTest(geom, motionRay, tmp_intersect, tmp_normal, tmpOutside);
@@ -290,11 +306,11 @@ __global__ void computeIntersections(
             {
                 t = sphereIntersectionTest(geom, motionRay, tmp_intersect, tmp_normal, tmpOutside);
             }
-            else if (geom.type == TORUS)
+            else if (PROCEDURAL_SHAPES_TEXTURES == 1 && geom.type == TORUS)
             {
                 t = torusIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
             }
-            else if (geom.type == MENGER)
+            else if (PROCEDURAL_SHAPES_TEXTURES == 1 && geom.type == MENGER)
             {
                 t = mengerIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, tmpOutside);
             }
@@ -519,16 +535,51 @@ __device__ glm::vec3 sampleDirectLighting(
 // Note that this shader does NOT do a BSDF evaluation!
 // Your shaders should handle that - this can allow techniques such as
 // bump mapping.
-
-__device__ glm::vec3 getProceduralTextureColor(const Material& material, glm::vec3 p)
+__device__ glm::vec3 sampleFileTexture(const Material& material, glm::vec3 p, const glm::vec3* texturePixels)
 {
-    if (material.textureType == TEXTURE_NONE) 
+    float u = p.x - floorf(p.x);
+    float v = p.y - floorf(p.y);
+
+    int x = (int)(u * material.textureWidth);
+    int y = (int)((1.0f - v) * material.textureHeight);
+
+    x = min(max(x, 0), material.textureWidth - 1);
+    y = min(max(y, 0), material.textureHeight - 1);
+
+    int index = material.textureOffset + y * material.textureWidth + x;
+
+    return texturePixels[index];
+}
+
+__device__ glm::vec3 getProceduralTextureColor(
+    const Material& material,
+    glm::vec3 p,
+    const glm::vec3* texturePixels)
+{
+    if (material.textureType == TEXTURE_NONE)
+    {
         return material.color;
+    }
+
+    if (material.textureType == TEXTURE_FILE)
+    {
+        if (FILE_TEXTURE_MAPPING == 1)
+        {
+            return sampleFileTexture(material, p, texturePixels);
+        }
+
+        return material.color;
+    }
 
     float scale = material.textureScale;
 
     if (material.textureType == TEXTURE_CHECKER)
     {
+        if (PROCEDURAL_SHAPES_TEXTURES == 0)
+        {
+            return material.color;
+        }
+
         int ix = (int)floorf(p.x * scale);
         int iy = (int)floorf(p.y * scale);
         int iz = (int)floorf(p.z * scale);
@@ -541,6 +592,11 @@ __device__ glm::vec3 getProceduralTextureColor(const Material& material, glm::ve
 
     if (material.textureType == TEXTURE_STRIPES)
     {
+        if (PROCEDURAL_SHAPES_TEXTURES == 0)
+        {
+            return material.color;
+        }
+
         int stripe = (int)floorf(p.y * scale);
         stripe = (stripe % 2 + 2) % 2;
 
@@ -549,6 +605,60 @@ __device__ glm::vec3 getProceduralTextureColor(const Material& material, glm::ve
     }
 
     return material.color;
+}
+
+__device__ float sampleBumpHeight(const Material& material, float u, float v, const glm::vec3* texturePixels)
+{
+    int x = (int)(u * material.bumpWidth);
+    int y = (int)((1.0f - v) * material.bumpHeight);
+
+    x = min(max(x, 0), material.bumpWidth - 1);
+    y = min(max(y, 0), material.bumpHeight - 1);
+
+    int index = material.bumpOffset + y * material.bumpWidth + x;
+
+    glm::vec3 c = texturePixels[index];
+
+    return (c.r + c.g + c.b) / 3.0f;
+}
+
+__device__ glm::vec3 applyBumpMapping(
+    const Material& material,
+    glm::vec3 p,
+    glm::vec3 normal,
+    const glm::vec3* texturePixels)
+{
+    if (material.bumpOffset < 0 || material.bumpStrength <= 0.0f) 
+        return normal;
+
+    float u = p.x - floorf(p.x);
+    float v = p.y - floorf(p.y);
+
+    float du = 1.0f / material.bumpWidth;
+    float dv = 1.0f / material.bumpHeight;
+
+    float hL = sampleBumpHeight(material, u - du, v, texturePixels);
+    float hR = sampleBumpHeight(material, u + du, v, texturePixels);
+    float hD = sampleBumpHeight(material, u, v - dv, texturePixels);
+    float hU = sampleBumpHeight(material, u, v + dv, texturePixels);
+
+    float dU = (hR - hL) * material.bumpStrength;
+    float dV = (hU - hD) * material.bumpStrength;
+
+    glm::vec3 tangent = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), normal));
+
+    if (glm::length(tangent) < 0.001f)
+    {
+        tangent = glm::normalize(glm::cross(glm::vec3(1.0f, 0.0f, 0.0f), normal));
+    }
+
+    tangent = glm::normalize(tangent);
+    
+    glm::vec3 bitangent = glm::normalize(glm::cross(normal, tangent));
+
+    glm::vec3 bumpedNormal = glm::normalize(normal - dU * tangent - dV * bitangent);
+
+    return bumpedNormal;
 }
 
 __global__ void shadeFakeMaterial(
@@ -560,7 +670,8 @@ __global__ void shadeFakeMaterial(
     Material* materials,
     Geom* geoms,
     int geoms_size,
-    glm::vec3* image)
+    glm::vec3* image,
+    const glm::vec3* texturePixels)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths && pathSegments[idx].remainingBounces > 0)
@@ -594,8 +705,19 @@ __global__ void shadeFakeMaterial(
             else {
                 glm::vec3 intersectPoint = getPointOnRay(pathSegments[idx].ray, intersection.t);
                 
-                material.color = getProceduralTextureColor(material, intersectPoint);
+                material.color = getProceduralTextureColor(material, intersectPoint, texturePixels);
                 
+                glm::vec3 surfaceNormal = intersection.surfaceNormal;
+
+                if (BUMP_MAPPING == 1)
+                {
+                    surfaceNormal = applyBumpMapping(
+                        material,
+                        intersectPoint,
+                        surfaceNormal,
+                        texturePixels
+                    );
+                }
                 thrust::default_random_engine rng =
                     makeSeededRandomEngine(
                         iter,
@@ -610,7 +732,7 @@ __global__ void shadeFakeMaterial(
                         sampleDirectLighting(
                             pathSegments[idx],
                             intersectPoint,
-                            intersection.surfaceNormal,
+                            surfaceNormal,
                             material,
                             geoms,
                             geoms_size,
@@ -626,7 +748,7 @@ __global__ void shadeFakeMaterial(
                 scatterRay(
                     pathSegments[idx],
                     intersectPoint,
-                    intersection.surfaceNormal,
+                    surfaceNormal,
                     material,
                     intersection.outside,
                     REFRACTION == 1,
@@ -843,7 +965,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_materials,
             dev_geoms,
             hst_scene->geoms.size(),
-            dev_image
+            dev_image,
+            dev_texturePixels
         );
 
         checkCUDAError("shade material");

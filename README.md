@@ -955,3 +955,95 @@ Rendering of procedural SDFs on the GPU is ideal due to the fact that each runni
 #### Further Optimization
 
 The existing implementation of the SDF intersection has a set limit of 128 tracing steps and a fixed threshold for the surface. This can be improved by applying bounding volumes to procedural objects to trace spheres only if the initial hit occurs in the bounding volume of an object. The Level-1 Menger Sponge can be further subdivided into higher levels and thus create a more complex fractal structure. Some SDF operations might also include smooth unions, twists, repetitions, and other CSF operations. The current implementation of procedural textures relies on hit position in the world space coordinates. The next step might involve object space evaluation or even UV mapping.
+
+### 2.9 Texture Mapping and Bump Mapping
+
+I extended the material system to support file-loaded textures in addition to the procedural textures implemented earlier. Image files are loaded on the CPU, converted into RGB values, stored in a contiguous texture buffer, and copied to GPU memory during path tracer initialization. For file-loaded textures, the surface intersection position is converted into repeated 2D texture coordinates. These coordinates are then mapped to a pixel in the texture image, and the sampled RGB value is used as the surface color.
+
+```cpp
+float u = p.x - floorf(p.x);
+float v = p.y - floorf(p.y);
+
+int x = (int)(u * material.textureWidth);
+int y = (int)((1.0f - v) * material.textureHeight);
+```
+
+Bump mapping was implemented using an image as a height map. Instead of changing the actual geometry, the height map is used to perturb the surface normal. Four neighboring height samples are evaluated around the current texture coordinate:
+
+```cpp
+float hL = sampleBumpHeight(material, u - du, v, texturePixels);
+float hR = sampleBumpHeight(material, u + du, v, texturePixels);
+float hD = sampleBumpHeight(material, u, v - dv, texturePixels);
+float hU = sampleBumpHeight(material, u, v + dv, texturePixels);
+
+float dU = (hR - hL) * material.bumpStrength;
+float dV = (hU - hD) * material.bumpStrength;
+```
+
+The height differences approximate the local slope of the bump map. A tangent and bitangent are constructed from the original surface normal, and the normal is perturbed using the sampled height gradient:
+
+```cpp
+glm::vec3 bumpedNormal =
+    glm::normalize(normal - dU * tangent - dV * bitangent);
+```
+
+The perturbed normal is then used for both direct lighting and ray scattering. This changes how the surface interacts with light without modifying the actual geometry or silhouette. File texture mapping and bump mapping can be independently enabled or disabled using `FILE_TEXTURE_MAPPING` and `BUMP_MAPPING`.
+
+#### Visual and Performance Comparison
+
+The following images were rendered using the same scene, camera, lighting configuration, and iteration count. The only difference between the two renders is whether texture mapping is enabled.
+
+| Texture OFF                                  |  Texture ON                                 |
+| ------------------------------------------------- | ----------------------------------------------- |
+| ![Bump Mapping OFF](./own_img/texture_mapping_off.png) | ![Bump Mapping ON](./own_img/bump_mapping_off.png) |
+
+The following images were rendered using the same scene, camera, lighting configuration, and iteration count. The only difference between the two renders is whether bump mapping is enabled.
+
+| Bump Mapping OFF                                  | Bump Mapping ON                                 |
+| ------------------------------------------------- | ----------------------------------------------- |
+| ![Bump Mapping OFF](./own_img/bump_mapping_off.png) | ![Bump Mapping ON](./own_img/bump_mapping_on.png) |
+
+The difference is easier to observe when the textured back wall is viewed more closely. With bump mapping disabled, the brick pattern changes only the surface color. With bump mapping enabled, the perturbed normals introduce additional local lighting variation around the brick structure.
+
+<table>
+  <tr>
+    <th align="center">Back Wall - Bump OFF</th>
+    <th align="center">Back Wall - Bump ON</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./own_img/bump_mapping_off_zoom.png" width="650">
+    </td>
+    <td align="center">
+      <img src="./own_img/bump_mapping_on_zoom.png" width="650">
+    </td>
+  </tr>
+</table>
+
+To compare the performance of procedural and file-loaded textures, the same scene and rendering settings were used while changing only the texture evaluation method. Bump mapping was disabled for the procedural-versus-file comparison. A third configuration enables bump mapping to measure its additional cost.
+
+| Configuration                  | Time / Frame |  FPS |
+| ------------------------------ | -----------: | ---: |
+| Procedural Texture             |    73.549 ms | 13.6 |
+| File-Loaded Texture - Bump OFF |    79.355 ms | 12.6 |
+| File-Loaded Texture - Bump ON  |    79.956 ms | 12.5 |
+
+The procedural texture required **73.549 ms/frame**, while the file-loaded texture required **79.355 ms/frame**, corresponding to an approximately **7.9% increase in frame time**. Procedural textures determine the surface color directly from the intersection position using arithmetic operations, while file-loaded textures additionally require indexed accesses to image data stored in GPU memory. Enabling bump mapping increased the frame time only slightly, from **79.355 ms/frame** to **79.956 ms/frame**, an increase of approximately **0.8%**. Bump mapping requires four neighboring height samples and an additional surface-normal calculation for each affected intersection, but the measured overhead remained small relative to the total path tracing workload in this scene.
+
+#### Analysis
+
+#### Analysis
+
+The results demonstrate the difference between texture mapping and bump mapping. Texture mapping changes the surface color using image data, while bump mapping changes the surface normal used during lighting and ray scattering. With bump mapping disabled, the brick pattern is visible because of the color texture, but the wall still responds to lighting as a geometrically flat surface. When bump mapping is enabled, variations in the height map perturb the normal direction, producing additional local lighting variation and making the brick surface appear more three-dimensional.
+
+The actual geometry is never displaced. Therefore, bump mapping can represent small-scale surface detail without adding additional geometry or increasing ray-geometry intersection complexity. The performance results also show that file-loaded textures introduce a moderate overhead compared with procedural textures. The procedural texture required **73.549 ms/frame**, while the file-loaded texture required **79.355 ms/frame**, an increase of approximately **7.9%**. This is expected because procedural textures rely mainly on arithmetic operations, while file-loaded textures require additional indexed memory accesses to texture data stored in GPU memory.
+
+Enabling bump mapping increased the frame time only slightly, from **79.355 ms/frame** to **79.956 ms/frame**, corresponding to an approximately **0.8%** increase. Although bump mapping requires four neighboring height samples and an additional normal perturbation calculation at each affected surface intersection, this overhead is small relative to the total path tracing workload in the tested scene. The texture data is uploaded to GPU memory during initialization and remains resident on the GPU during rendering, avoiding repeated CPU-to-GPU transfers each frame.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+Texture mapping and bump mapping are two techniques that are ideal for GPU processing because the computations for each intersection with the surface are independent of one another. The computation of texture look-up and perturbed normals can be achieved independently by thousands of CUDA threads with active rays.If we were to design such an implementation using a CPU, we would use many fewer CPU threads for doing the same thing, namely, performing the texture look-up, calculating the neighboring height samples, gradient calculation, and perturbation of normals. The procedural textures involve mostly arithmetic operations, while file textures involve memory look-ups besides other operations. Bump mapping adds to the number of texture samples since multiple neighboring height samples are needed at each surface intersection.
+
+#### Further Optimization
+
+Currently, the application uses manual texture fetching from a global memory buffer on the GPU. An idea to optimize is to employ CUDA texture objects that offer special texture cache as well as addressing and filtering capabilities. The current texture look-up based on nearest neighbor approach can be substituted with bilinear filtering to ensure better magnification of the textures. With respect to the bump mapping technique, one can precompute a normal map instead of fetching the four closest height-map values and computing the gradient. Lastly, currently the texture coordinates are computed on the basis of the surface intersection coordinates. One could extend the algorithm to use explicitly defined UV coordinates.

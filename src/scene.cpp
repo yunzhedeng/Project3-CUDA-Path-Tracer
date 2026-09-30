@@ -5,6 +5,7 @@
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include "json.hpp"
+#include "stb_image.h"
 
 #include <fstream>
 #include <iostream>
@@ -13,6 +14,38 @@
 
 using namespace std;
 using json = nlohmann::json;
+
+TextureData loadTextureFromFile(const std::string& filename)
+{
+    TextureData texture;
+
+    int channels;
+    unsigned char* data = stbi_load(filename.c_str(), &texture.width, &texture.height, &channels, 3);
+
+    if (data == nullptr)
+    {
+        std::cerr << "Failed to load texture: " << filename << std::endl;
+        texture.width = 0;
+        texture.height = 0;
+        return texture;
+    }
+
+    int pixelCount = texture.width * texture.height;
+    texture.pixels.resize(pixelCount);
+
+    for (int i = 0; i < pixelCount; i++)
+    {
+        float r = data[i * 3 + 0] / 255.0f;
+        float g = data[i * 3 + 1] / 255.0f;
+        float b = data[i * 3 + 2] / 255.0f;
+
+        texture.pixels[i] = glm::vec3(r, g, b);
+    }
+
+    stbi_image_free(data);
+
+    return texture;
+}
 
 Scene::Scene(string filename)
 {
@@ -71,6 +104,16 @@ void Scene::loadFromJSON(const std::string& jsonName)
         newMaterial.textureColor = glm::vec3(0.0f);
         newMaterial.textureScale = 1.0f;
 
+        newMaterial.textureWidth = 0;
+        newMaterial.textureHeight = 0;
+        newMaterial.textureIndex = -1;
+        newMaterial.textureOffset = -1;
+
+        newMaterial.bumpWidth = 0;
+        newMaterial.bumpHeight = 0;
+        newMaterial.bumpOffset = -1;
+        newMaterial.bumpStrength = 0.0f;
+
         if (p.contains("TEXTURE"))
         {
             std::string texture = p["TEXTURE"];
@@ -93,6 +136,49 @@ void Scene::loadFromJSON(const std::string& jsonName)
             if (p.contains("TEXTURE_SCALE"))
             {
                 newMaterial.textureScale = p["TEXTURE_SCALE"];
+            }
+        }
+
+        if (p.contains("TEXTURE_FILE"))
+        {
+            std::string textureFile = p["TEXTURE_FILE"];
+
+            TextureData texture = loadTextureFromFile(textureFile);
+
+            if (texture.width > 0 && texture.height > 0)
+            {
+                newMaterial.textureType = TEXTURE_FILE;
+                newMaterial.textureIndex = static_cast<int>(textures.size());
+                newMaterial.textureWidth = texture.width;
+                newMaterial.textureHeight = texture.height;
+                newMaterial.textureOffset = static_cast<int>(texturePixels.size());
+
+                texturePixels.insert(texturePixels.end(), texture.pixels.begin(), texture.pixels.end());
+                textures.push_back(texture);
+            }
+        }
+
+        if (p.contains("BUMP_FILE"))
+        {
+            std::string bumpFile = p["BUMP_FILE"];
+            TextureData bump = loadTextureFromFile(bumpFile);
+
+            if (bump.width > 0 && bump.height > 0)
+            {
+                newMaterial.bumpWidth = bump.width;
+                newMaterial.bumpHeight = bump.height;
+                newMaterial.bumpOffset = static_cast<int>(texturePixels.size());
+
+                texturePixels.insert(texturePixels.end(), bump.pixels.begin(), bump.pixels.end());
+
+                if (p.contains("BUMP_STRENGTH"))
+                {
+                    newMaterial.bumpStrength = p["BUMP_STRENGTH"];
+                }
+                else
+                {
+                    newMaterial.bumpStrength = 1.0f;
+                }
             }
         }
         MatNameToID[name] = materials.size();
