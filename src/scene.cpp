@@ -12,6 +12,8 @@
 #include <string>
 #include <unordered_map>
 #include <sstream>
+#include <algorithm>
+#include <cfloat>
 
 using namespace std;
 using json = nlohmann::json;
@@ -127,6 +129,106 @@ std::vector<Triangle> loadOBJ(
     }
 
     return triangles;
+}
+
+static void getTriangleBounds(
+    const Triangle& triangle,
+    glm::vec3& minBounds,
+    glm::vec3& maxBounds)
+{
+    minBounds = glm::min(
+        triangle.v0,
+        glm::min(triangle.v1, triangle.v2)
+    );
+
+    maxBounds = glm::max(
+        triangle.v0,
+        glm::max(triangle.v1, triangle.v2)
+    );
+}
+
+static glm::vec3 getTriangleCentroid(
+    const Triangle& triangle)
+{
+    return (triangle.v0 + triangle.v1 + triangle.v2) / 3.0f;
+}
+
+static int buildBVHRecursive(std::vector<Triangle>& triangles, std::vector<BVHNode>& nodes, int start, int end)
+{
+    int nodeIndex = static_cast<int>(nodes.size());
+    nodes.push_back(BVHNode{});
+
+    glm::vec3 minBounds(FLT_MAX);
+    glm::vec3 maxBounds(-FLT_MAX);
+    glm::vec3 centroidMin(FLT_MAX);
+    glm::vec3 centroidMax(-FLT_MAX);
+
+    for (int i = start; i < end; i++)
+    {
+        glm::vec3 triMin;
+        glm::vec3 triMax;
+        getTriangleBounds(triangles[i], triMin, triMax);
+        minBounds = glm::min(minBounds, triMin);
+        maxBounds = glm::max(maxBounds, triMax);
+
+        glm::vec3 centroid = getTriangleCentroid(triangles[i]);
+        centroidMin = glm::min(centroidMin, centroid);
+        centroidMax = glm::max(centroidMax, centroid);
+    }
+
+    int triangleCount = end - start;
+
+    nodes[nodeIndex].minBounds = minBounds;
+    nodes[nodeIndex].maxBounds = maxBounds;
+
+    if (triangleCount <= 4)
+    {
+        nodes[nodeIndex].leftChild = -1;
+        nodes[nodeIndex].rightChild = -1;
+        nodes[nodeIndex].triangleStart = start;
+        nodes[nodeIndex].triangleCount = triangleCount;
+        return nodeIndex;
+    }
+
+    glm::vec3 extent = centroidMax - centroidMin;
+    int axis = 0;
+
+    if (extent.y > extent.x && extent.y >= extent.z)
+    {
+        axis = 1;
+    }
+    else if (extent.z > extent.x && extent.z > extent.y)
+    {
+        axis = 2;
+    }
+
+    int mid = start + triangleCount / 2;
+
+    std::nth_element(triangles.begin() + start, triangles.begin() + mid, triangles.begin() + end, [axis](const Triangle& a, const Triangle& b) { return getTriangleCentroid(a)[axis] < getTriangleCentroid(b)[axis]; });
+
+    int leftChild = buildBVHRecursive(triangles, nodes, start, mid);
+    int rightChild = buildBVHRecursive(triangles, nodes, mid, end);
+
+    nodes[nodeIndex].leftChild = leftChild;
+    nodes[nodeIndex].rightChild = rightChild;
+    nodes[nodeIndex].triangleStart = -1;
+    nodes[nodeIndex].triangleCount = 0;
+
+    return nodeIndex;
+}
+
+static void buildBVH(std::vector<Triangle>& triangles, std::vector<BVHNode>& nodes)
+{
+    nodes.clear();
+
+    if (triangles.empty())
+    {
+        return;
+    }
+
+    buildBVHRecursive(triangles, nodes, 0, static_cast<int>(triangles.size()));
+
+    std::cout << "BVH built: " << nodes.size() << " nodes for " << triangles.size() << " triangles" << std::endl;
 }
 
 void Scene::loadFromJSON(const std::string& jsonName)
@@ -315,6 +417,11 @@ void Scene::loadFromJSON(const std::string& jsonName)
         newGeom.invTranspose = glm::inverseTranspose(newGeom.transform);
 
         geoms.push_back(newGeom);
+    }
+
+    if (!triangles.empty())
+    {
+        buildBVH(triangles, bvhNodes);
     }
     const auto& cameraData = data["Camera"];
     Camera& camera = state.camera;

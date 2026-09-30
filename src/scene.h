@@ -16,5 +16,6 @@ public:
     std::vector<TextureData> textures;
     std::vector<glm::vec3> texturePixels;
     std::vector<Triangle> triangles;
+    std::vector<BVHNode> bvhNodes;
     RenderState state;
 };

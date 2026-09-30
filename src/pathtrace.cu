@@ -51,6 +51,8 @@
 
 #define OBJ_MESH_LOADING 1
 
+#define BVH_ACCELERATION 1
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -118,6 +120,7 @@ static ShadeableIntersection* dev_intersections = NULL;
 static glm::vec3* dev_texturePixels = NULL;
 static int* dev_material_ids = NULL;
 static Triangle* dev_triangles = NULL;
+static BVHNode* dev_bvhNodes = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
@@ -152,17 +155,14 @@ void pathtraceInit(Scene* scene)
 
     if (!scene->triangles.empty())
     {
-        cudaMalloc(
-            &dev_triangles,
-            scene->triangles.size() * sizeof(Triangle)
-        );
+        cudaMalloc(&dev_triangles, scene->triangles.size() * sizeof(Triangle));
+        cudaMemcpy(dev_triangles, scene->triangles.data(), scene->triangles.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+    }
 
-        cudaMemcpy(
-            dev_triangles,
-            scene->triangles.data(),
-            scene->triangles.size() * sizeof(Triangle),
-            cudaMemcpyHostToDevice
-        );
+    if (!scene->bvhNodes.empty())
+    {
+        cudaMalloc(&dev_bvhNodes, scene->bvhNodes.size() * sizeof(BVHNode));
+        cudaMemcpy(dev_bvhNodes, scene->bvhNodes.data(), scene->bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
     }
 
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
@@ -192,6 +192,7 @@ void pathtraceFree()
     cudaFree(dev_material_ids);
     cudaFree(dev_texturePixels);
     cudaFree(dev_triangles);
+    cudaFree(dev_bvhNodes);
     // TODO: clean up any extra device memory you created
 
     checkCUDAError("pathtraceFree");

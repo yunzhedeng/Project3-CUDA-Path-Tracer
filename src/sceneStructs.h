@@ -130,3 +130,15 @@ struct Triangle
 
     int materialId;
 };
+
+struct BVHNode
+{
+    glm::vec3 minBounds;
+    glm::vec3 maxBounds;
+
+    int leftChild;
+    int rightChild;
+
+    int triangleStart;
+    int triangleCount;
+};
