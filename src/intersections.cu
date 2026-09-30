@@ -259,3 +259,59 @@ __host__ __device__ float sphereIntersectionTest(
 
     return glm::length(r.origin - intersectionPoint);
 }
+
+__device__ float triangleIntersectionTest(
+    const Triangle& triangle,
+    const Ray& ray,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal)
+{
+    const float EPSILON = 0.000001f;
+
+    glm::vec3 edge1 = triangle.v1 - triangle.v0;
+    glm::vec3 edge2 = triangle.v2 - triangle.v0;
+
+    glm::vec3 h = glm::cross(ray.direction, edge2);
+    float a = glm::dot(edge1, h);
+
+    if (fabsf(a) < EPSILON)
+    {
+        return -1.0f;
+    }
+
+    float f = 1.0f / a;
+
+    glm::vec3 s = ray.origin - triangle.v0;
+    float u = f * glm::dot(s, h);
+
+    if (u < 0.0f || u > 1.0f)
+    {
+        return -1.0f;
+    }
+
+    glm::vec3 q = glm::cross(s, edge1);
+    float v = f * glm::dot(ray.direction, q);
+
+    if (v < 0.0f || u + v > 1.0f)
+    {
+        return -1.0f;
+    }
+
+    float t = f * glm::dot(edge2, q);
+
+    if (t <= EPSILON)
+    {
+        return -1.0f;
+    }
+
+    intersectionPoint = ray.origin + t * ray.direction;
+
+    normal = triangle.normal;
+
+    if (glm::dot(normal, ray.direction) > 0.0f)
+    {
+        normal = -normal;
+    }
+
+    return t;
+}

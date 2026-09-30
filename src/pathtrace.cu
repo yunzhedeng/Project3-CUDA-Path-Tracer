@@ -49,6 +49,8 @@
 
 #define BUMP_MAPPING 0
 
+#define OBJ_MESH_LOADING 1
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -115,6 +117,7 @@ static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static glm::vec3* dev_texturePixels = NULL;
 static int* dev_material_ids = NULL;
+static Triangle* dev_triangles = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 
@@ -147,6 +150,21 @@ void pathtraceInit(Scene* scene)
         cudaMemcpy(dev_texturePixels, scene->texturePixels.data(), scene->texturePixels.size() * sizeof(glm::vec3), cudaMemcpyHostToDevice);
     }
 
+    if (!scene->triangles.empty())
+    {
+        cudaMalloc(
+            &dev_triangles,
+            scene->triangles.size() * sizeof(Triangle)
+        );
+
+        cudaMemcpy(
+            dev_triangles,
+            scene->triangles.data(),
+            scene->triangles.size() * sizeof(Triangle),
+            cudaMemcpyHostToDevice
+        );
+    }
+
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
@@ -173,6 +191,7 @@ void pathtraceFree()
     cudaFree(dev_intersections);
     cudaFree(dev_material_ids);
     cudaFree(dev_texturePixels);
+    cudaFree(dev_triangles);
     // TODO: clean up any extra device memory you created
 
     checkCUDAError("pathtraceFree");
@@ -264,6 +283,8 @@ __global__ void computeIntersections(
     PathSegment* pathSegments,
     Geom* geoms,
     int geoms_size,
+    Triangle* triangles,
+    int triangles_size,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -276,6 +297,7 @@ __global__ void computeIntersections(
         glm::vec3 normal;
         float t_min = FLT_MAX;
         int hit_geom_index = -1;
+        int hitMaterialId = -1;
         bool hitOutside = true;
 
         glm::vec3 tmp_intersect;
@@ -322,21 +344,46 @@ __global__ void computeIntersections(
             {
                 t_min = t;
                 hit_geom_index = i;
+                hitMaterialId = geom.materialid;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
                 hitOutside = tmpOutside;
             }
         }
+        if (OBJ_MESH_LOADING == 1)
+        {
+            for (int i = 0; i < triangles_size; i++)
+            {
+                glm::vec3 triIntersect;
+                glm::vec3 triNormal;
 
-        if (hit_geom_index == -1)
+                float triT = triangleIntersectionTest(
+                    triangles[i],
+                    pathSegment.ray,
+                    triIntersect,
+                    triNormal
+                );
+
+                if (triT > 0.0f && triT < t_min)
+                {
+                    t_min = triT;
+                    hit_geom_index = -2;
+                    hitMaterialId = triangles[i].materialId;
+                    intersect_point = triIntersect;
+                    normal = triNormal;
+                    hitOutside = true;
+                }
+            }
+        }
+
+        if (hitMaterialId == -1)
         {
             intersections[path_index].t = -1.0f;
         }
         else
         {
-            // The ray hits something
             intersections[path_index].t = t_min;
-            intersections[path_index].materialId = geoms[hit_geom_index].materialid;
+            intersections[path_index].materialId = hitMaterialId;
             intersections[path_index].surfaceNormal = normal;
             intersections[path_index].outside = hitOutside;
         }
@@ -918,6 +965,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_geoms,
             hst_scene->geoms.size(),
+            dev_triangles,
+            hst_scene->triangles.size(),
             dev_intersections
         );
         checkCUDAError("trace one bounce");

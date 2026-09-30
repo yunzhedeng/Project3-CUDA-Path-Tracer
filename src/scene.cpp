@@ -11,6 +11,7 @@
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <sstream>
 
 using namespace std;
 using json = nlohmann::json;
@@ -62,6 +63,70 @@ Scene::Scene(string filename)
         cout << "Couldn't read from " << filename << endl;
         exit(-1);
     }
+}
+
+std::vector<Triangle> loadOBJ(
+    const std::string& filename,
+    int materialId)
+{
+    std::vector<Triangle> triangles;
+    std::vector<glm::vec3> vertices;
+
+    std::ifstream file(filename);
+
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open OBJ: " << filename << std::endl;
+        return triangles;
+    }
+
+    std::string line;
+
+    while (std::getline(file, line))
+    {
+        std::stringstream ss(line);
+
+        std::string type;
+        ss >> type;
+
+        if (type == "v")
+        {
+            float x;
+            float y;
+            float z;
+
+            ss >> x >> y >> z;
+
+            vertices.push_back(glm::vec3(x, y, z));
+        }
+        else if (type == "f")
+        {
+            int i0;
+            int i1;
+            int i2;
+
+            ss >> i0 >> i1 >> i2;
+
+            Triangle tri;
+
+            tri.v0 = vertices[i0 - 1];
+            tri.v1 = vertices[i1 - 1];
+            tri.v2 = vertices[i2 - 1];
+
+            tri.normal = glm::normalize(
+                glm::cross(
+                    tri.v1 - tri.v0,
+                    tri.v2 - tri.v0
+                )
+            );
+
+            tri.materialId = materialId;
+
+            triangles.push_back(tri);
+        }
+    }
+
+    return triangles;
 }
 
 void Scene::loadFromJSON(const std::string& jsonName)
@@ -188,6 +253,32 @@ void Scene::loadFromJSON(const std::string& jsonName)
     for (const auto& p : objectsData)
     {
         const auto& type = p["TYPE"];
+        
+        if (type == "obj")
+        {
+            int materialId = MatNameToID[p["MATERIAL"]];
+            std::string objFile = p["FILE"];
+
+            std::vector<Triangle> objTriangles =
+                loadOBJ(objFile, materialId);
+
+            triangles.insert(
+                triangles.end(),
+                objTriangles.begin(),
+                objTriangles.end()
+            );
+
+            std::cout
+                << "Loaded OBJ: "
+                << objFile
+                << " with "
+                << objTriangles.size()
+                << " triangles"
+                << std::endl;
+
+            continue;
+        }
+        
         Geom newGeom;
         if (type == "cube")
         {

@@ -86,3 +86,9 @@ __host__ __device__ float mengerIntersectionTest(
     glm::vec3& intersectionPoint, 
     glm::vec3& normal, 
     bool& outside);
+
+__device__ float triangleIntersectionTest(
+    const Triangle& triangle,
+    const Ray& ray,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal);

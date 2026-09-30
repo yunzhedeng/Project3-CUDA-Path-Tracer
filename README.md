@@ -993,8 +993,8 @@ The perturbed normal is then used for both direct lighting and ray scattering. T
 
 The following images were rendered using the same scene, camera, lighting configuration, and iteration count. The only difference between the two renders is whether texture mapping is enabled.
 
-| Texture OFF                                  |  Texture ON                                 |
-| ------------------------------------------------- | ----------------------------------------------- |
+| Texture OFF                                          | Texture ON                                       |
+| ---------------------------------------------------- | ------------------------------------------------ |
 | ![Bump Mapping OFF](./own_img/texture_mapping_off.png) | ![Bump Mapping ON](./own_img/bump_mapping_off.png) |
 
 The following images were rendered using the same scene, camera, lighting configuration, and iteration count. The only difference between the two renders is whether bump mapping is enabled.
@@ -1047,3 +1047,103 @@ Texture mapping and bump mapping are two techniques that are ideal for GPU proce
 #### Further Optimization
 
 Currently, the application uses manual texture fetching from a global memory buffer on the GPU. An idea to optimize is to employ CUDA texture objects that offer special texture cache as well as addressing and filtering capabilities. The current texture look-up based on nearest neighbor approach can be substituted with bilinear filtering to ensure better magnification of the textures. With respect to the bump mapping technique, one can precompute a normal map instead of fetching the four closest height-map values and computing the gradient. Lastly, currently the texture coordinates are computed on the basis of the surface intersection coordinates. One could extend the algorithm to use explicitly defined UV coordinates.
+
+### 2.10 OBJ Mesh Loading
+
+I extended the renderer to support triangle meshes loaded from OBJ files. Instead of limiting the scene to built-in analytic primitives such as spheres and cubes, an OBJ file can now be parsed on the CPU and converted into a list of triangles that are transferred to the GPU for ray intersection. A triangle is represented using its three vertex positions, face normal, and material ID:
+
+```cpp
+struct Triangle
+{
+    glm::vec3 v0;
+    glm::vec3 v1;
+    glm::vec3 v2;
+
+    glm::vec3 normal;
+
+    int materialId;
+};
+```
+
+The OBJ loader currently supports vertex position (`v`) and triangular face (`f`) records. Vertex positions are stored first, and each face references three vertices using the OBJ indices. Since OBJ indices begin at 1 while C++ vectors begin at 0, the indices are converted during loading:
+
+```cpp
+tri.v0 = vertices[i0 - 1];
+tri.v1 = vertices[i1 - 1];
+tri.v2 = vertices[i2 - 1];
+```
+
+A flat face normal is calculated when the triangle is created:
+
+```cpp
+tri.normal = glm::normalize(
+    glm::cross(
+        tri.v1 - tri.v0,
+        tri.v2 - tri.v0
+    )
+);
+```
+
+After loading, all triangles are stored in `Scene::triangles` and copied into a contiguous GPU buffer during path tracer initialization:
+
+```cpp
+cudaMalloc(
+    &dev_triangles,
+    scene->triangles.size() * sizeof(Triangle)
+);
+
+cudaMemcpy(
+    dev_triangles,
+    scene->triangles.data(),
+    scene->triangles.size() * sizeof(Triangle),
+    cudaMemcpyHostToDevice
+);
+```
+
+Ray-triangle intersection is performed directly on the GPU using the Möller-Trumbore algorithm. The barycentric coordinates `u` and `v` are used to determine whether the ray intersection lies inside the triangle:
+
+```cpp
+if (u < 0.0f || u > 1.0f)
+{
+    return -1.0f;
+}
+
+if (v < 0.0f || u + v > 1.0f)
+{
+    return -1.0f;
+}
+```
+
+In scene intersections, the renderer will check the built-in analytical shapes first and then checks the OBJ triangles that have been imported. The closest valid intersection is always kept regardless of whether it was an imported OBJ triangle or the built-in shapes. A separate `hitMaterialId` is stored so that OBJ triangles can use the same existing material and shading system as other geometry. OBJ mesh intersection can be enabled or disabled using:
+
+```cpp
+#define OBJ_MESH_LOADING 1
+```
+
+#### Visual and Performance Comparison
+
+In order to confirm the functionality of the mesh loader, a simple OBJ cube with 8 **vertices** and **12 triangles** was created. While the displayed object looks like a cube, it does not employ the built-in `CUBE` object and `boxIntersectionTest`. All six sides of the object are drawn using triangles that were loaded from the OBJ file and intersected via the new algorithm.
+
+<p align="center">
+  <img src="./own_img/obj_mesh_loading.png" width="50%">
+</p>
+
+The final OBJ test scene rendered at approximately **70.100 ms/frame (14.3 FPS)**. This timing was included simply to be a representative example and not as an optimization against controlled conditions. The current OBJ code does a linear scan of all the triangles loaded for each ray, meaning the cost of intersection is linearly related to complexity of the mesh. In this case with the current 12-triangle model, this will work just fine. However, in the case of a more realistic OBJ file that uses thousands or millions of triangles, it would be far too costly.
+
+#### Analysis
+
+From the output, we can see that the OBJ loading pipeline has successfully been implemented from parsing through GPU shading. In the rendering process, the loader reads the mesh vertices and faces in the CPU, converts the faces into `Triangles`, passes the triangles to GPU, and performs ray-triangle intersection tests while doing path tracing.
+
+The test cube is especially effective for showing the differences between the analytical and mesh representation of the objects. The original renderer can create the cube from a single primitive and do an intersection test with the help of `boxIntersectionTest`. The OBJ implementation does the same thing but with twelve separate triangles that form the cube.
+
+After the triangle is hit, the material ID is assigned to the `ShadeableIntersection` class in which the existing rendering algorithm is storing it. Thus, the existing material and shading system can be used without developing an additional OBJ shader.
+
+The existing parser is designed to parse only the minimal set of OBJ features that are needed for the triangles' rendering. Thus, at the moment it understands vertex locations and triangular faces but cannot parse texture coordinates, imported normals, materials, and polygon faces with more than three vertices.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+Intersection of a ray with a triangle is an operation that greatly gains from running on the GPU due to the fact that each active ray performs its own triangle test independently of the other active rays. This would be equally true of a CPU implementation of the barycentric intersection, although with significantly fewer concurrent threads being employed. The high number of independent tests of this type as the complexity of the mesh increases is what makes GPU execution feasible. But the current naive implementation still requires the testing of every active ray against every triangle in the mesh regardless of the advantages of GPU execution.
+
+#### Further Optimization
+
+First of all, there is a hierarchical acceleration structure that needs to be added to improve performance - namely, Bounding Volume Hierarchy (BVH). Rather than checking the intersection between every single ray and triangle, the ray should first check the intersection with boxes that hold several triangles. Then all of those triangles can be skipped in case of a negative result.  Another way to optimize would be to modify the OBJ loader and make it capable of loading vertex normals `vn` for smooth shading and `vt` for UV textures. This would enable texture mapping based on the position of the mesh. Further enhancements may involve support for polygonal triangulation, multiple OBJ objects, material libraries `.mtl`, and transformations of meshes (translation, rotation, and scaling).
