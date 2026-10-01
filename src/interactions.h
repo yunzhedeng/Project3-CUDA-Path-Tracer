@@ -92,3 +92,10 @@ __host__ __device__ void scatterRay(
     int iter, 
     int depth,
     thrust::default_random_engine& rng);
+
+
+__device__ bool rayAABBIntersection(
+    const Ray& ray, 
+    const glm::vec3& minBounds, 
+    const glm::vec3& maxBounds, 
+    float maxT);

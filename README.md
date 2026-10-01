@@ -7,6 +7,38 @@ CUDA Path Tracer
   * [LinkedIn](https://www.linkedin.com/in/yunzhedeng), [personal website](https://yunzhedeng.com)
 * Tested on: Windows 11, Intel Core i7-10750H @ 2.60GHz, 16 GB RAM, NVIDIA GeForce RTX 2060 (Personal Computer)
 
+<p align="center">
+  <img src="./own_img/cover.png" width="85%">
+</p>
+
+<p align="center">
+  <i>CUDA path tracer featuring physically based rendering, procedural geometry, texture and bump mapping, arbitrary OBJ mesh loading, and BVH acceleration.</i>
+</p>
+
+## Table of Contents
+
+### Part 1 - Core Path Tracer
+- [1.1 Diffuse BSDF and Multi-Bounce Path Tracing](#11-diffuse-bsdf-and-multi-bounce-path-tracing)
+- [1.2 Stream Compaction](#12-stream-compaction)
+- [1.3 Material Sorting](#13-material-sorting)
+- [1.4 Stochastic Sampled Antialiasing](#14-stochastic-sampled-antialiasing)
+
+### Part 2 - Additional Features
+- [2.1 Russian Roulette Path Termination](#21-russian-roulette-path-termination)
+- [2.2 Depth of Field](#22-depth-of-field)
+- [2.3 Refraction and Fresnel Effects](#23-refraction-and-fresnel-effects)
+- [2.4 Direct Lighting](#24-direct-lighting)
+- [2.5 Low-Discrepancy Sampling](#25-low-discrepancy-sampling)
+- [2.6 Motion Blur](#26-motion-blur)
+- [2.7 Restartable Path Tracing](#27-restartable-path-tracing)
+- [2.8 Procedural Shapes and Textures](#28-procedural-shapes-and-textures)
+- [2.9 Texture Mapping and Bump Mapping](#29-texture-mapping-and-bump-mapping)
+- [2.10 OBJ Mesh Loading](#210-obj-mesh-loading)
+- [2.11 BVH Acceleration](#211-bvh-acceleration)
+
+### Part 3 - Final Model Credit
+- [Pegasus Model Credit](#part-3---final-model-credit)
+
 ## Part 1 - Core Path Tracer
 
 The core renderer is a CUDA-based Monte Carlo path tracer supporting cosine-weighted diffuse scattering, multi-bounce indirect illumination, emissive surfaces, stream compaction, material sorting, and stochastic sampled antialiasing.
@@ -1050,7 +1082,50 @@ Currently, the application uses manual texture fetching from a global memory buf
 
 ### 2.10 OBJ Mesh Loading
 
-I extended the renderer to support triangle meshes loaded from OBJ files. Instead of limiting the scene to built-in analytic primitives such as spheres and cubes, an OBJ file can now be parsed on the CPU and converted into a list of triangles that are transferred to the GPU for ray intersection. A triangle is represented using its three vertex positions, face normal, and material ID:
+I implemented OBJ mesh loading to allow the path tracer to render arbitrary triangle meshes in addition to the original built-in primitives. The OBJ loader runs during scene initialization and reads vertex positions from `v` entries and face definitions from `f` entries. Each vertex is transformed immediately using the translation, rotation, and scale specified for the OBJ object in the scene file.
+
+```cpp
+if (type == "v")
+{
+    float x;
+    float y;
+    float z;
+
+    ss >> x >> y >> z;
+
+    glm::vec4 transformed = transform * glm::vec4(x, y, z, 1.0f);
+    vertices.push_back(glm::vec3(transformed));
+}
+```
+
+OBJ face entries may contain slash-separated indices such as: v/vt/vn. For the current implementation, only the vertex-position index is required. The loader extracts the portion before the first `/`.
+
+```cpp
+size_t slashPos = token.find('/');
+std::string vertexIndexString = token.substr(0, slashPos);
+int vertexIndex = std::stoi(vertexIndexString) - 1;
+faceIndices.push_back(vertexIndex);
+```
+
+Faces containing more than three vertices are converted into triangles using fan triangulation.
+
+```cpp
+for (int i = 1; i < static_cast<int>(faceIndices.size()) - 1; i++)
+{
+    Triangle tri;
+
+    tri.v0 = vertices[faceIndices[0]];
+    tri.v1 = vertices[faceIndices[i]];
+    tri.v2 = vertices[faceIndices[i + 1]];
+
+    tri.normal = glm::normalize(glm::cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+    tri.materialId = materialId;
+
+    triangles.push_back(tri);
+}
+```
+
+Each triangle stores three world-space vertices, a flat face normal, and a material ID.
 
 ```cpp
 struct Triangle
@@ -1065,48 +1140,36 @@ struct Triangle
 };
 ```
 
-The OBJ loader currently supports vertex position (`v`) and triangular face (`f`) records. Vertex positions are stored first, and each face references three vertices using the OBJ indices. Since OBJ indices begin at 1 while C++ vectors begin at 0, the indices are converted during loading:
+The loaded triangle array is transferred to GPU memory before rendering. Ray-triangle intersection is performed on the GPU using the Möller-Trumbore intersection algorithm.
 
 ```cpp
-tri.v0 = vertices[i0 - 1];
-tri.v1 = vertices[i1 - 1];
-tri.v2 = vertices[i2 - 1];
+glm::vec3 edge1 = triangle.v1 - triangle.v0;
+glm::vec3 edge2 = triangle.v2 - triangle.v0;
+
+glm::vec3 h = glm::cross(ray.direction, edge2);
+float a = glm::dot(edge1, h);
+
+if (fabsf(a) < EPSILON)
+{
+    return -1.0f;
+}
 ```
 
-A flat face normal is calculated when the triangle is created:
+The barycentric coordinates are then tested to determine whether the ray intersects the interior of the triangle.
 
 ```cpp
-tri.normal = glm::normalize(
-    glm::cross(
-        tri.v1 - tri.v0,
-        tri.v2 - tri.v0
-    )
-);
-```
+float f = 1.0f / a;
 
-After loading, all triangles are stored in `Scene::triangles` and copied into a contiguous GPU buffer during path tracer initialization:
+glm::vec3 s = ray.origin - triangle.v0;
+float u = f * glm::dot(s, h);
 
-```cpp
-cudaMalloc(
-    &dev_triangles,
-    scene->triangles.size() * sizeof(Triangle)
-);
-
-cudaMemcpy(
-    dev_triangles,
-    scene->triangles.data(),
-    scene->triangles.size() * sizeof(Triangle),
-    cudaMemcpyHostToDevice
-);
-```
-
-Ray-triangle intersection is performed directly on the GPU using the Möller-Trumbore algorithm. The barycentric coordinates `u` and `v` are used to determine whether the ray intersection lies inside the triangle:
-
-```cpp
 if (u < 0.0f || u > 1.0f)
 {
     return -1.0f;
 }
+
+glm::vec3 q = glm::cross(s, edge1);
+float v = f * glm::dot(ray.direction, q);
 
 if (v < 0.0f || u + v > 1.0f)
 {
@@ -1114,36 +1177,232 @@ if (v < 0.0f || u + v > 1.0f)
 }
 ```
 
-In scene intersections, the renderer will check the built-in analytical shapes first and then checks the OBJ triangles that have been imported. The closest valid intersection is always kept regardless of whether it was an imported OBJ triangle or the built-in shapes. A separate `hitMaterialId` is stored so that OBJ triangles can use the same existing material and shading system as other geometry. OBJ mesh intersection can be enabled or disabled using:
+The triangle normal is reversed when necessary so that it faces against the incoming ray.
 
 ```cpp
-#define OBJ_MESH_LOADING 1
+normal = triangle.normal;
+
+if (glm::dot(normal, ray.direction) > 0.0f)
+{
+    normal = -normal;
+}
+```
+
+OBJ objects can be added directly through the JSON scene description and use the same translation, rotation, and scale parameters as the other geometry in the renderer.
+
+```json
+{
+    "TYPE": "obj",
+    "FILE": "models/model.obj",
+    "MATERIAL": "diffuse_white",
+    "TRANS": [0.0, 0.0, 0.0],
+    "ROTAT": [0.0, 0.0, 0.0],
+    "SCALE": [1.0, 1.0, 1.0]
+}
 ```
 
 #### Visual and Performance Comparison
 
-In order to confirm the functionality of the mesh loader, a simple OBJ cube with 8 **vertices** and **12 triangles** was created. While the displayed object looks like a cube, it does not employ the built-in `CUBE` object and `boxIntersectionTest`. All six sides of the object are drawn using triangles that were loaded from the OBJ file and intersected via the new algorithm.
+The following result demonstrates a third-party OBJ model successfully imported, triangulated, transformed, and rendered using the CUDA path tracer.
 
 <p align="center">
   <img src="./own_img/obj_mesh_loading.png" width="50%">
 </p>
 
-The final OBJ test scene rendered at approximately **70.100 ms/frame (14.3 FPS)**. This timing was included simply to be a representative example and not as an optimization against controlled conditions. The current OBJ code does a linear scan of all the triangles loaded for each ray, meaning the cost of intersection is linearly related to complexity of the mesh. In this case with the current 12-triangle model, this will work just fine. However, in the case of a more realistic OBJ file that uses thousands or millions of triangles, it would be far too costly.
+For this feature, the primary goal was to verify correct loading and rendering of arbitrary triangle meshes. Performance optimization for large meshes is evaluated separately in the BVH Acceleration section below.
 
 #### Analysis
 
-From the output, we can see that the OBJ loading pipeline has successfully been implemented from parsing through GPU shading. In the rendering process, the loader reads the mesh vertices and faces in the CPU, converts the faces into `Triangles`, passes the triangles to GPU, and performs ray-triangle intersection tests while doing path tracing.
+The OBJ loader improves the renderer from supporting a set of analytically defined primitives to supporting arbitrary mesh geometry based on triangles. First, the loader loads an OBJ file and turns all faces into one or more `Triangle` data structures. Since all faces are triangulated using fan algorithm, only one geometry type is needed by the intersection stage, no matter how many vertices the face initially had.
 
-The test cube is especially effective for showing the differences between the analytical and mesh representation of the objects. The original renderer can create the cube from a single primitive and do an intersection test with the help of `boxIntersectionTest`. The OBJ implementation does the same thing but with twelve separate triangles that form the cube.
+In addition, the object's transformation matrix is applied while loading, meaning that triangles loaded to GPU are located in world space and thus do not need to be transformed every time they are checked by intersection test. A drawback of the current implementation of the loader is that only positions of vertices are parsed from OBJ faces indices. Indices of texture coordinates and vertex normals are not supported at this point. Thus each triangle has a normal vector computed using positions of all three vertices.
 
-After the triangle is hit, the material ID is assigned to the `ShadeableIntersection` class in which the existing rendering algorithm is storing it. Thus, the existing material and shading system can be used without developing an additional OBJ shader.
-
-The existing parser is designed to parse only the minimal set of OBJ features that are needed for the triangles' rendering. Thus, at the moment it understands vertex locations and triangular faces but cannot parse texture coordinates, imported normals, materials, and polygon faces with more than three vertices.
+Initial implementation of the loader performed intersection test of each ray with each triangle. While producing the correct result, it is computationally very inefficient for complex geometry and became a direct motivation for BVH implementation, described in the next section.
 
 #### GPU vs. Hypothetical CPU Implementation
 
-Intersection of a ray with a triangle is an operation that greatly gains from running on the GPU due to the fact that each active ray performs its own triangle test independently of the other active rays. This would be equally true of a CPU implementation of the barycentric intersection, although with significantly fewer concurrent threads being employed. The high number of independent tests of this type as the complexity of the mesh increases is what makes GPU execution feasible. But the current naive implementation still requires the testing of every active ray against every triangle in the mesh regardless of the advantages of GPU execution.
+Parsing of the OBJ file is done on the CPU since it is an initialization task that requires text manipulation, dynamic containers, and triangulation of polygons. Once the parsing process has been completed, the outputted array of triangles is uploaded into GPU memory. The intersection of rays and triangles is done on the GPU. Every path can test its geometry independently; hence thousands of rays can run concurrently. An example of how the ray tracing process could be implemented on a CPU is by using the same Möller-Trumbore algorithm, but in this case, there will be much less parallelization when processing many independent rays. The chosen implementation therefore keeps the irregular one-time parsing work on the CPU while moving the highly parallel intersection workload to the GPU.
 
 #### Further Optimization
 
-First of all, there is a hierarchical acceleration structure that needs to be added to improve performance - namely, Bounding Volume Hierarchy (BVH). Rather than checking the intersection between every single ray and triangle, the ray should first check the intersection with boxes that hold several triangles. Then all of those triangles can be skipped in case of a negative result.  Another way to optimize would be to modify the OBJ loader and make it capable of loading vertex normals `vn` for smooth shading and `vt` for UV textures. This would enable texture mapping based on the position of the mesh. Further enhancements may involve support for polygonal triangulation, multiple OBJ objects, material libraries `.mtl`, and transformations of meshes (translation, rotation, and scaling).
+The OBJ loader could be extended to import vertex normals and texture coordinates from `vn` and `vt` entries. These values could then be interpolated using barycentric coordinates to support smooth shading and texture mapping directly on OBJ meshes.
+
+Support for `.mtl` files could also allow a single OBJ model to contain multiple materials.
+
+The current implementation calculates one flat normal for each generated triangle. Smooth vertex normals would improve the appearance of curved surfaces without increasing the geometric complexity of the mesh.
+
+Most importantly, brute-force intersection testing scales poorly as triangle count increases. The BVH acceleration structure described below addresses this problem by rejecting large groups of triangles before individual ray-triangle tests are performed.
+
+### 2.11 BVH Acceleration
+
+To accelerate intersection testing for complex OBJ meshes, I implemented a Bounding Volume Hierarchy (BVH). Without acceleration, every active ray must be tested against every triangle in the mesh. For large models, this brute-force approach produces an extremely large number of ray-triangle intersection tests. The BVH groups triangles into a hierarchy of axis-aligned bounding boxes so that large portions of the mesh can be rejected using relatively inexpensive ray-box intersection tests. Each BVH node stores its bounding box and either two child-node indices or a range of triangles when the node is a leaf.
+
+```cpp
+struct BVHNode
+{
+    glm::vec3 minBounds;
+    glm::vec3 maxBounds;
+
+    int leftChild;
+    int rightChild;
+
+    int triangleStart;
+    int triangleCount;
+};
+```
+
+The BVH is constructed recursively on the CPU after all OBJ triangles have been loaded. For each node, the bounds of every triangle in the node are combined to produce the node's axis-aligned bounding box.
+
+```cpp
+glm::vec3 triMin;
+glm::vec3 triMax;
+
+getTriangleBounds(triangles[i], triMin, triMax);
+
+minBounds = glm::min(minBounds, triMin);
+maxBounds = glm::max(maxBounds, triMax);
+```
+
+The implementation also computes the bounds of the triangle centroids. The longest centroid axis is selected as the splitting axis.
+
+```cpp
+glm::vec3 extent = centroidMax - centroidMin;
+int axis = 0;
+
+if (extent.y > extent.x && extent.y >= extent.z)
+{
+    axis = 1;
+}
+else if (extent.z > extent.x && extent.z > extent.y)
+{
+    axis = 2;
+}
+```
+
+Triangles are partitioned around the median centroid using `std::nth_element`.
+
+```cpp
+int mid = start + triangleCount / 2;
+
+std::nth_element(
+    triangles.begin() + start,
+    triangles.begin() + mid,
+    triangles.begin() + end,
+    [axis](const Triangle& a, const Triangle& b)
+    {
+        return getTriangleCentroid(a)[axis] < getTriangleCentroid(b)[axis];
+    });
+```
+
+A node becomes a leaf when it contains four or fewer triangles.
+
+```cpp
+if (triangleCount <= 4)
+{
+    nodes[nodeIndex].leftChild = -1;
+    nodes[nodeIndex].rightChild = -1;
+    nodes[nodeIndex].triangleStart = start;
+    nodes[nodeIndex].triangleCount = triangleCount;
+
+    return nodeIndex;
+}
+```
+
+After construction, the complete BVH node array is copied to GPU memory. BVH traversal is performed iteratively on the GPU using an explicit stack.
+
+```cpp
+int stack[64];
+int stackSize = 0;
+stack[stackSize++] = 0;
+
+while (stackSize > 0)
+{
+    int nodeIndex = stack[--stackSize];
+    BVHNode node = bvhNodes[nodeIndex];
+
+    if (!rayAABBIntersection(
+        pathSegment.ray,
+        node.minBounds,
+        node.maxBounds,
+        t_min))
+    {
+        continue;
+    }
+
+    // Process leaf triangles or continue to child nodes.
+}
+```
+
+When a leaf node is reached, only the triangles contained in that leaf require full ray-triangle intersection tests.
+
+```cpp
+if (node.triangleCount > 0)
+{
+    int end = node.triangleStart + node.triangleCount;
+
+    for (int i = node.triangleStart; i < end; i++)
+    {
+        glm::vec3 triIntersect;
+        glm::vec3 triNormal;
+
+        float triT = triangleIntersectionTest(
+            triangles[i],
+            pathSegment.ray,
+            triIntersect,
+            triNormal);
+
+        if (triT > 0.0f && triT < t_min)
+        {
+            t_min = triT;
+            hitMaterialId = triangles[i].materialId;
+            intersect_point = triIntersect;
+            normal = triNormal;
+            hitOutside = true;
+        }
+    }
+}
+```
+
+This toggle allows the acceleration structure to be directly compared against the original brute-force implementation.
+
+#### Visual and Performance Comparison
+
+The BVH and brute-force implementations were tested using the same complex OBJ scene, resolution, camera configuration, path depth, and rendering settings. The only changed setting was `BVH_ACCELERATION`. Because the brute-force version was extremely slow for this model, the comparison was measured after approximately 10 iterations.
+
+| Configuration | Average Frame Time |      FPS |
+| ------------- | -----------------: | -------: |
+| BVH OFF       |  7320.221 ms/frame |  0.1 FPS |
+| BVH ON        |    72.444 ms/frame | 13.8 FPS |
+
+Therefore, enabling BVH acceleration reduced the measured frame time by approximately **99.01%** and produced approximately a **101.05× speedup** for this complex OBJ scene.
+
+#### Analysis
+
+The performance difference demonstrates why an acceleration structure becomes essential when rendering high-triangle-count meshes. With BVH disabled, every active ray performs a brute-force loop over the entire triangle array. If a mesh contains `N` triangles, each ray may require up to `N` expensive Möller-Trumbore intersection tests.
+
+In the case of complex geometry and hundreds of thousands of rays, this leads to an incredible amount of redundant intersection computation. On the benchmarked scene, the naive algorithm took roughly **7320.221 ms/frame**, while BVH-based ray-tracing reduced it to just **72.444 ms/frame**. Additional computations come from the intersection of rays and bounding boxes, as well as traversal through the tree. But these operations are significantly less expensive than the operation of testing every single triangle. In case of a complex geometry, a vast majority of rays intersect just a few nodes of the BVH and check only a fraction of the triangle list.
+
+But then, there is also a strong dependency of the performance gain offered by the BVH on the complexity of the scene. In the case of very small meshes, the performance overhead involved in the traversal of the BVH will be similar to that of the simple test of the few triangles that exist. But as mesh complexity grows higher, the number of triangles whose test is spared will increase dramatically, hence increasing the efficiency of the acceleration data structure. But the final output is not affected.
+
+#### GPU vs. Hypothetical CPU Implementation
+
+The BVH is built on the CPU when the scene is initialized. CPU construction is advantageous because constructing the BVH entails a recursive subdivision step, rearrangement of triangles, computation of centroids, and `std::nth_element`. The BVH construction step is done just once before the rendering step starts. Afterwards, the sorted list of triangles and the BVH node list are loaded into the GPU's memory. Traversing the BVH happens independently for each ray on the GPU. Since the renderer could handle hundreds of thousands of rays at the same time, GPU execution results in huge parallelism. Each CUDA thread traverses the BVH in the same manner but for different rays.
+
+#### Further Optimization
+
+The current BVH implements a median split on the longest axis of the centroid. It provides a fairly well-balanced tree and is easy to implement but doesn't optimize expected ray traversal costs directly. An alternative approach might be to employ the **Surface Area Heuristic (SAH)** when evaluating candidate splits and choosing those that are more likely to result in minimized intersection calculations. The current algorithm pushes both children onto the stack without checking which one is closer to the ray. Checking bounding boxes of two children first and traversing the closest one ahead of the other can save some computation time. An intersection with a triangle that is closer will provide an opportunity to decrease `t_min` earlier and exclude other bounding boxes. The threshold for leaves is set to four triangles at the moment.
+
+The effect of using various leaf sizes may reveal the right compromise between tree traversal costs and the number of ray-triangle intersection calculations. Moreover, the size of the node in the BVH could also be optimized for better performance in terms of memory locality and reduced bandwidth on the GPU. Lastly, more advanced GPU-friendly acceleration data structures can help minimize branch divergence and improve cache coherence of neighboring threads.
+
+## Part 3 - Final Model Credit
+
+The final complex mesh used to demonstrate OBJ mesh loading and benchmark BVH acceleration is **Pegasus Statue sculpture statuette figurine horse**, created by **Dean3000** and downloaded from **CGTrader**.
+
+The model was provided as an OBJ mesh and was used as third-party geometry only. All OBJ loading, triangulation, ray-triangle intersection, BVH construction, and GPU BVH traversal were implemented as part of this renderer.
+
+For the final scene, I placed the Pegasus on a dark pedestal and constructed a warm emissive halo using cube primitives. I configured warm key lighting and cool blue rim lighting to emphasize the statue's shape, and added a glass sphere to demonstrate reflection and refraction. The render uses stochastic antialiasing, low-discrepancy sampling, and linear-to-sRGB conversion for the final PNG output.
+
+**Model:** Pegasus Statue sculpture statuette figurine horse  
+**Creator:** Dean3000  
+**Source:** CGTrader  
+**License:** Royalty Free License (no AI)

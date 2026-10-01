@@ -190,3 +190,46 @@ __host__ __device__ void scatterRay(
         pathSegment.allowEmission = false;
     }
 }
+
+__device__ bool rayAABBIntersection(const Ray& ray, const glm::vec3& minBounds, const glm::vec3& maxBounds, float maxT)
+{
+    float tMin = 0.0f;
+    float tMax = maxT;
+
+    for (int axis = 0; axis < 3; axis++)
+    {
+        float origin = ray.origin[axis];
+        float direction = ray.direction[axis];
+
+        if (fabsf(direction) < 0.000001f)
+        {
+            if (origin < minBounds[axis] || origin > maxBounds[axis])
+            {
+                return false;
+            }
+
+            continue;
+        }
+
+        float invDirection = 1.0f / direction;
+        float t0 = (minBounds[axis] - origin) * invDirection;
+        float t1 = (maxBounds[axis] - origin) * invDirection;
+
+        if (t0 > t1)
+        {
+            float temp = t0;
+            t0 = t1;
+            t1 = temp;
+        }
+
+        tMin = fmaxf(tMin, t0);
+        tMax = fminf(tMax, t1);
+
+        if (tMax < tMin)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}

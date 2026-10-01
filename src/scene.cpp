@@ -69,7 +69,8 @@ Scene::Scene(string filename)
 
 std::vector<Triangle> loadOBJ(
     const std::string& filename,
-    int materialId)
+    int materialId,
+    const glm::mat4& transform)
 {
     std::vector<Triangle> triangles;
     std::vector<glm::vec3> vertices;
@@ -99,32 +100,35 @@ std::vector<Triangle> loadOBJ(
 
             ss >> x >> y >> z;
 
-            vertices.push_back(glm::vec3(x, y, z));
+            glm::vec4 transformed = transform * glm::vec4(x, y, z, 1.0f);
+            vertices.push_back(glm::vec3(transformed));
         }
         else if (type == "f")
         {
-            int i0;
-            int i1;
-            int i2;
+            std::vector<int> faceIndices;
+            std::string token;
 
-            ss >> i0 >> i1 >> i2;
+            while (ss >> token)
+            {
+                size_t slashPos = token.find('/');
+                std::string vertexIndexString = token.substr(0, slashPos);
+                int vertexIndex = std::stoi(vertexIndexString) - 1;
+                faceIndices.push_back(vertexIndex);
+            }
 
-            Triangle tri;
+            for (int i = 1; i < static_cast<int>(faceIndices.size()) - 1; i++)
+            {
+                Triangle tri;
 
-            tri.v0 = vertices[i0 - 1];
-            tri.v1 = vertices[i1 - 1];
-            tri.v2 = vertices[i2 - 1];
+                tri.v0 = vertices[faceIndices[0]];
+                tri.v1 = vertices[faceIndices[i]];
+                tri.v2 = vertices[faceIndices[i + 1]];
 
-            tri.normal = glm::normalize(
-                glm::cross(
-                    tri.v1 - tri.v0,
-                    tri.v2 - tri.v0
-                )
-            );
+                tri.normal = glm::normalize(glm::cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+                tri.materialId = materialId;
 
-            tri.materialId = materialId;
-
-            triangles.push_back(tri);
+                triangles.push_back(tri);
+            }
         }
     }
 
@@ -361,22 +365,21 @@ void Scene::loadFromJSON(const std::string& jsonName)
             int materialId = MatNameToID[p["MATERIAL"]];
             std::string objFile = p["FILE"];
 
-            std::vector<Triangle> objTriangles =
-                loadOBJ(objFile, materialId);
+            glm::vec3 translation(0.0f);
+            glm::vec3 rotation(0.0f);
+            glm::vec3 scale(1.0f);
 
-            triangles.insert(
-                triangles.end(),
-                objTriangles.begin(),
-                objTriangles.end()
-            );
+            if (p.contains("TRANS")) translation = glm::vec3(p["TRANS"][0], p["TRANS"][1], p["TRANS"][2]);
+            if (p.contains("ROTAT")) rotation = glm::vec3(p["ROTAT"][0], p["ROTAT"][1], p["ROTAT"][2]);
+            if (p.contains("SCALE")) scale = glm::vec3(p["SCALE"][0], p["SCALE"][1], p["SCALE"][2]);
 
-            std::cout
-                << "Loaded OBJ: "
-                << objFile
-                << " with "
-                << objTriangles.size()
-                << " triangles"
-                << std::endl;
+            glm::mat4 transform = utilityCore::buildTransformationMatrix(translation, rotation, scale);
+
+            std::vector<Triangle> objTriangles = loadOBJ(objFile, materialId, transform);
+
+            triangles.insert(triangles.end(), objTriangles.begin(), objTriangles.end());
+
+            std::cout << "Loaded OBJ: " << objFile << " with " << objTriangles.size() << " triangles" << std::endl;
 
             continue;
         }

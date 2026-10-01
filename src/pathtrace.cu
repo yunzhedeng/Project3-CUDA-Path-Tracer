@@ -26,20 +26,20 @@
 
 #define SORT_BY_MATERIAL 0
 
-#define ANTI_ALIASING 0
+#define ANTI_ALIASING 1
 
-#define RUSSIAN_ROULETTE 0
+#define RUSSIAN_ROULETTE 1
 #define RR_START_DEPTH 3
 
 #define DEPTH_OF_FIELD 0
 #define DOF_APERTURE_RADIUS 0.70f
 #define DOF_FOCAL_DISTANCE 10.5f
 
-#define REFRACTION 0
+#define REFRACTION 1
 
-#define DIRECT_LIGHTING 1
+#define DIRECT_LIGHTING 0
 
-#define LOW_DISCREPANCY_SAMPLING 0
+#define LOW_DISCREPANCY_SAMPLING 1
 
 #define MOTION_BLUR 0
 
@@ -95,12 +95,18 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution, int iter, glm
     if (x < resolution.x && y < resolution.y)
     {
         int index = x + (y * resolution.x);
-        glm::vec3 pix = image[index];
+        glm::vec3 pix = glm::clamp(image[index] / static_cast<float>(iter), glm::vec3(0.0f), glm::vec3(1.0f));
+
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            float linear = pix[channel];
+            pix[channel] = linear <= 0.0031308f ? 12.92f * linear : 1.055f * powf(linear, 1.0f / 2.4f) - 0.055f;
+        }
 
         glm::ivec3 color;
-        color.x = glm::clamp((int)(pix.x / iter * 255.0), 0, 255);
-        color.y = glm::clamp((int)(pix.y / iter * 255.0), 0, 255);
-        color.z = glm::clamp((int)(pix.z / iter * 255.0), 0, 255);
+        color.x = glm::clamp((int)(pix.x * 255.0f + 0.5f), 0, 255);
+        color.y = glm::clamp((int)(pix.y * 255.0f + 0.5f), 0, 255);
+        color.z = glm::clamp((int)(pix.z * 255.0f + 0.5f), 0, 255);
 
         // Each thread writes one pixel location in the texture (textel)
         pbo[index].w = 0;
@@ -286,6 +292,8 @@ __global__ void computeIntersections(
     int geoms_size,
     Triangle* triangles,
     int triangles_size,
+    BVHNode* bvhNodes,
+    int bvhNodeCount,
     ShadeableIntersection* intersections)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -297,7 +305,6 @@ __global__ void computeIntersections(
         glm::vec3 intersect_point;
         glm::vec3 normal;
         float t_min = FLT_MAX;
-        int hit_geom_index = -1;
         int hitMaterialId = -1;
         bool hitOutside = true;
 
@@ -344,35 +351,83 @@ __global__ void computeIntersections(
             if (t > 0.0f && t_min > t)
             {
                 t_min = t;
-                hit_geom_index = i;
                 hitMaterialId = geom.materialid;
                 intersect_point = tmp_intersect;
                 normal = tmp_normal;
                 hitOutside = tmpOutside;
             }
         }
+       
         if (OBJ_MESH_LOADING == 1)
         {
-            for (int i = 0; i < triangles_size; i++)
+            if (BVH_ACCELERATION == 1 && bvhNodeCount > 0)
             {
-                glm::vec3 triIntersect;
-                glm::vec3 triNormal;
+                int stack[64];
+                int stackSize = 0;
+                stack[stackSize++] = 0;
 
-                float triT = triangleIntersectionTest(
-                    triangles[i],
-                    pathSegment.ray,
-                    triIntersect,
-                    triNormal
-                );
-
-                if (triT > 0.0f && triT < t_min)
+                while (stackSize > 0)
                 {
-                    t_min = triT;
-                    hit_geom_index = -2;
-                    hitMaterialId = triangles[i].materialId;
-                    intersect_point = triIntersect;
-                    normal = triNormal;
-                    hitOutside = true;
+                    int nodeIndex = stack[--stackSize];
+                    BVHNode node = bvhNodes[nodeIndex];
+
+                    if (!rayAABBIntersection(pathSegment.ray, node.minBounds, node.maxBounds, t_min))
+                    {
+                        continue;
+                    }
+
+                    if (node.triangleCount > 0)
+                    {
+                        int end = node.triangleStart + node.triangleCount;
+
+                        for (int i = node.triangleStart; i < end; i++)
+                        {
+                            glm::vec3 triIntersect;
+                            glm::vec3 triNormal;
+
+                            float triT = triangleIntersectionTest(triangles[i], pathSegment.ray, triIntersect, triNormal);
+
+                            if (triT > 0.0f && triT < t_min)
+                            {
+                                t_min = triT;
+                                hitMaterialId = triangles[i].materialId;
+                                intersect_point = triIntersect;
+                                normal = triNormal;
+                                hitOutside = true;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (node.leftChild >= 0 && stackSize < 64)
+                        {
+                            stack[stackSize++] = node.leftChild;
+                        }
+
+                        if (node.rightChild >= 0 && stackSize < 64)
+                        {
+                            stack[stackSize++] = node.rightChild;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < triangles_size; i++)
+                {
+                    glm::vec3 triIntersect;
+                    glm::vec3 triNormal;
+
+                    float triT = triangleIntersectionTest(triangles[i], pathSegment.ray, triIntersect, triNormal);
+
+                    if (triT > 0.0f && triT < t_min)
+                    {
+                        t_min = triT;
+                        hitMaterialId = triangles[i].materialId;
+                        intersect_point = triIntersect;
+                        normal = triNormal;
+                        hitOutside = true;
+                    }
                 }
             }
         }
@@ -968,6 +1023,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             hst_scene->geoms.size(),
             dev_triangles,
             hst_scene->triangles.size(),
+            dev_bvhNodes,
+            hst_scene->bvhNodes.size(),
             dev_intersections
         );
         checkCUDAError("trace one bounce");
