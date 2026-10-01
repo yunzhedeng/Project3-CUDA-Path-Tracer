@@ -37,7 +37,7 @@ CUDA Path Tracer
 - [2.11 BVH Acceleration](#211-bvh-acceleration)
 
 ### Part 3 - Final Model Credit
-- [Pegasus Model Credit](#part-3---final-model-credit)
+- [Pegasus Model Credit](#part-3-final-model-credit)
 
 ## Part 1 - Core Path Tracer
 
@@ -1394,7 +1394,7 @@ The current BVH implements a median split on the longest axis of the centroid. I
 
 The effect of using various leaf sizes may reveal the right compromise between tree traversal costs and the number of ray-triangle intersection calculations. Moreover, the size of the node in the BVH could also be optimized for better performance in terms of memory locality and reduced bandwidth on the GPU. Lastly, more advanced GPU-friendly acceleration data structures can help minimize branch divergence and improve cache coherence of neighboring threads.
 
-## Part 3 - Final Model Credit
+## Part 3 Final Model Credit
 
 The final complex mesh used to demonstrate OBJ mesh loading and benchmark BVH acceleration is **Pegasus Statue sculpture statuette figurine horse**, created by **Dean3000** and downloaded from **CGTrader**.
 
